@@ -1,3 +1,8 @@
+# This is where we put our custom gitignore stuff
+# Ignore any trained models
+*.pt
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
