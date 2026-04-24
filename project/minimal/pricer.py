@@ -280,5 +280,5 @@ if __name__ == "__main__":
     print("── Testing ──")
     test(S_test, hedging_net)
 
-    save_model(hedging_net, "minimal_model.pt")
+    save_model(hedging_net)
 
