@@ -335,6 +335,10 @@ def test(S_test: np.ndarray, hedging_net: HedgingNet) -> None:
         ax.set_ylabel("Count")
         ax.legend(fontsize=9)
 
+    # add more tests here
+    # save the results
+    
+
     plt.tight_layout()
     plt.savefig(project_path("results/figures/minimal_pnl.png"), dpi=150, bbox_inches="tight")
     plt.close()
