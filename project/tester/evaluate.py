@@ -325,7 +325,7 @@ def fig_delta_surface(net: HedgingNet) -> None:
 
     vmin, vmax = 0.0, 1.0
     cmap_main  = "RdYlGn"
-    cmap_err   = "RdBu"
+    cmap_err   = "RdBu_r"
 
     for ax, data, title, cm, v0, v1 in [
         (axes[0], nn_surface,    "NN Delta  δ(S/K, τ)",   cmap_main, vmin, vmax),
@@ -349,20 +349,18 @@ def fig_delta_surface(net: HedgingNet) -> None:
     print("Figure 3 saved: eval_delta_surface.png")
 
 
-# -- Figure 4: Statistical Diagnostics ----------------------------------------
+# -- Figure 4a: QQ plots -------------------------------------------------------
 
-def fig_statistics(pnl_nn: np.ndarray, pnl_bsm: np.ndarray,
-                   S_test: np.ndarray, net: HedgingNet) -> None:
+def fig_qq(pnl_nn: np.ndarray, S_test: np.ndarray, net: HedgingNet) -> None:
     nn_d  = nn_deltas_batch(S_test, net)
     bsm_d = bsm_deltas_batch(S_test)
-    delta_err = nn_d - bsm_d              # (N_PATHS, N)
-    times     = np.linspace(0, T, N)
+    t_mid = N // 2
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
-    fig.suptitle("Statistical Diagnostics", fontsize=14, y=1.01)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle("Quantile Plots", fontsize=13)
 
-    # -- (0,0) QQ plot of NN P&L vs Normal --
-    ax = axes[0, 0]
+    # -- (0) QQ plot of NN P&L vs Normal --
+    ax = axes[0]
     (osm, osr), (slope, intercept, _) = stats.probplot(pnl_nn, dist="norm")
     ax.scatter(osm, osr, s=4, alpha=0.4, color="#4C72B0", label="NN P&L quantiles")
     x_line = np.array([osm.min(), osm.max()])
@@ -373,14 +371,43 @@ def fig_statistics(pnl_nn: np.ndarray, pnl_bsm: np.ndarray,
     ax.set_title("QQ Plot: NN P&L vs Normal")
     ax.legend(fontsize=9)
 
-    # -- (0,1) Mean absolute delta error over time by moneyness bucket --
-    ax    = axes[0, 1]
-    S_T   = S_test[N, :]
+    # -- (1) NN delta vs BSM delta scatter at tau = 0.5 --
+    ax   = axes[1]
+    ax.scatter(bsm_d[:, t_mid], nn_d[:, t_mid], s=3, alpha=0.25, color="#4C72B0")
+    lims = [min(bsm_d[:, t_mid].min(), nn_d[:, t_mid].min()),
+            max(bsm_d[:, t_mid].max(), nn_d[:, t_mid].max())]
+    ax.plot(lims, lims, color="red", linewidth=1.0, linestyle="--", label="Perfect agreement")
+    corr = np.corrcoef(bsm_d[:, t_mid], nn_d[:, t_mid])[0, 1]
+    ax.set_xlabel("BSM delta at tau = 0.5")
+    ax.set_ylabel("NN delta at tau = 0.5")
+    ax.set_title(f"NN vs BSM Delta at Mid-Life  (r = {corr:.4f})")
+    ax.legend(fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(project_path("results/tester/eval_qq.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print("Figure 4a saved: eval_qq.png")
+
+
+# -- Figure 4b: Delta tracking diagnostics ------------------------------------
+
+def fig_delta_tracking(S_test: np.ndarray, net: HedgingNet) -> None:
+    nn_d  = nn_deltas_batch(S_test, net)
+    bsm_d = bsm_deltas_batch(S_test)
+    delta_err = nn_d - bsm_d
+    times     = np.linspace(0, T, N)
+    S_T       = S_test[N, :]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle("Delta Tracking Error", fontsize=13)
+
+    # -- (0) Mean absolute delta error over time by moneyness bucket --
+    ax = axes[0]
     buckets = [
-        (S_T < 0.95,          "OTM  (S_T < 0.95)",   "#E74C3C"),
-        ((S_T >= 0.95) & (S_T < 1.00), "OTM-ATM",    "#E67E22"),
-        ((S_T >= 1.00) & (S_T < 1.05), "ATM-ITM",    "#27AE60"),
-        (S_T >= 1.05,          "ITM  (S_T > 1.05)",   "#2980B9"),
+        (S_T < 0.95,                     "OTM  (S_T < 0.95)",  "#E74C3C"),
+        ((S_T >= 0.95) & (S_T < 1.00),  "OTM-ATM",            "#E67E22"),
+        ((S_T >= 1.00) & (S_T < 1.05),  "ATM-ITM",            "#27AE60"),
+        (S_T >= 1.05,                    "ITM  (S_T > 1.05)",  "#2980B9"),
     ]
     for mask, label, color in buckets:
         if mask.sum() > 10:
@@ -388,39 +415,25 @@ def fig_statistics(pnl_nn: np.ndarray, pnl_bsm: np.ndarray,
             ax.plot(times, mean_abs_err, label=f"{label} (n={mask.sum()})",
                     color=color, linewidth=1.2)
     ax.set_xlabel("Time")
-    ax.set_ylabel("|NN delta − BSM delta|")
+    ax.set_ylabel("|NN delta - BSM delta|")
     ax.set_title("Mean Absolute Delta Error Over Time")
     ax.legend(fontsize=8)
 
-    # -- (1,0) NN delta vs BSM delta scatter at τ = 0.5 --
-    ax    = axes[1, 0]
-    t_mid = N // 2
-    ax.scatter(bsm_d[:, t_mid], nn_d[:, t_mid],
-               s=3, alpha=0.25, color="#4C72B0")
-    lims = [min(bsm_d[:, t_mid].min(), nn_d[:, t_mid].min()),
-            max(bsm_d[:, t_mid].max(), nn_d[:, t_mid].max())]
-    ax.plot(lims, lims, color="red", linewidth=1.0, linestyle="--", label="Perfect agreement")
-    corr = np.corrcoef(bsm_d[:, t_mid], nn_d[:, t_mid])[0, 1]
-    ax.set_xlabel("BSM delta at τ = 0.5")
-    ax.set_ylabel("NN delta at τ = 0.5")
-    ax.set_title(f"NN vs BSM Delta at Mid-Life  (r = {corr:.4f})")
-    ax.legend(fontsize=9)
-
-    # -- (1,1) Distribution of per-path mean absolute delta error --
-    ax = axes[1, 1]
+    # -- (1) Distribution of per-path mean absolute delta error --
+    ax = axes[1]
     per_path_mae = np.abs(delta_err).mean(axis=1)
     ax.hist(per_path_mae, bins=50, color="#4C72B0", alpha=0.8, edgecolor="none", density=True)
     ax.axvline(per_path_mae.mean(), color="red", linewidth=1.2, linestyle="--",
                label=f"Mean MAE = {per_path_mae.mean():.4f}")
-    ax.set_xlabel("Per-path mean |NN delta − BSM delta|")
+    ax.set_xlabel("Per-path mean |NN delta - BSM delta|")
     ax.set_ylabel("Density")
     ax.set_title("Distribution of Per-Path Delta Tracking Error")
     ax.legend(fontsize=9)
 
     plt.tight_layout()
-    plt.savefig(project_path("results/tester/eval_statistics.png"), dpi=150, bbox_inches="tight")
+    plt.savefig(project_path("results/tester/eval_delta_tracking.png"), dpi=150, bbox_inches="tight")
     plt.close()
-    print("Figure 4 saved: eval_statistics.png")
+    print("Figure 4b saved: eval_delta_tracking.png")
 
 
 # -- Main ----------------------------------------------------------------------
@@ -449,6 +462,7 @@ if __name__ == "__main__":
     fig_pnl_analysis(pnl_nn, pnl_bsm, S_test)
     fig_delta_paths(S_test, net)
     fig_delta_surface(net)
-    fig_statistics(pnl_nn, pnl_bsm, S_test, net)
+    fig_qq(pnl_nn, S_test, net)
+    fig_delta_tracking(S_test, net)
 
     print(f"\nAll outputs saved to results/tester/")
