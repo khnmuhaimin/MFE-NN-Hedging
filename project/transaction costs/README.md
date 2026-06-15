@@ -10,16 +10,27 @@ The key insight: BSM delta hedging was derived assuming a frictionless market. W
 
 | File | Purpose |
 |------|---------|
-| `pricer.py` | Simulate paths, train network, save model and epoch losses |
-| `evaluate.py` | Load trained model, run all tests, generate all plots |
+| `pricer.py` | Train MSE model (single κ), save to `results/transaction costs/models/` |
+| `evaluate.py` | Load MSE model, run all tests and plots (single κ) |
+| `MultiTrain.py` | Train MSE models across κ ∈ {0.0, 0.001, 0.005, 0.01, 0.02} |
+| `MultiEvaluate.py` | Load all MSE models, produce multi-κ comparison plots |
+| `pricer_cvar.py` | Train CVaR model (single κ), save with `_cvar` suffix |
+| `CVaRTrain.py` | Train CVaR models across all κ values |
+| `CVaREvaluate.py` | Load MSE + CVaR models, produce side-by-side tail risk comparison |
 | `README.md` | This file |
 
-**Run order:**
+**Run order (MSE):**
 ```
-python "project/transaction costs/pricer.py"    # train
-python "project/transaction costs/evaluate.py"  # evaluate
+python "project/transaction costs/MultiTrain.py"
+python "project/transaction costs/MultiEvaluate.py"
 ```
-Both must be run from the project root.
+
+**Run order (CVaR comparison):**
+```
+python "project/transaction costs/CVaRTrain.py"
+python "project/transaction costs/CVaREvaluate.py"
+```
+All scripts must be run from the project root.
 
 ## Model Setup
 
@@ -163,12 +174,63 @@ Trained and evaluated separate models at κ ∈ {0.0, 0.001, 0.005, 0.01, 0.02} 
 
 ---
 
+---
+
+## CVaR Loss Extension
+
+### Motivation
+
+MSE loss minimises `E[pnl²] = Var[pnl] + E[pnl]²`, treating all paths equally. An alternative is **Conditional Value-at-Risk (CVaR / Expected Shortfall)**, which targets only the worst (1−α) fraction of outcomes. A CVaR-trained hedger should theoretically tolerate wider variance on average in order to reduce catastrophic tail losses.
+
+### Implementation Notes
+
+CVaR loss uses the Rockafellar-Uryasev (2000) formula:
+
+```
+CVaR_α(losses) = z + 1/(1−α) * E[max(losses − z, 0)]
+```
+
+where `losses = −pnl` and `z` is the α-quantile of losses (the VaR estimate).
+
+**Key implementation challenge — premium anchoring:**
+Unlike MSE (where `E[pnl²]` is minimised at `E[pnl]=0` automatically), the CVaR gradient with respect to the premium is always −1: raising the premium improves every path's P&L, which always reduces CVaR. Without a constraint, gradient descent drives the premium to +∞.
+
+The fix uses gradient routing: the CVaR gradient is *blocked* from reaching the premium by detaching it within the CVaR computation. A separate zero-mean penalty (`λ * E[pnl]²`) anchors the premium independently. This cleanly separates the two objectives:
+- **Delta parameters**: updated purely by CVaR (tail optimisation)
+- **Premium**: updated purely by `E[pnl]²` (fair pricing)
+
+### CVaR vs MSE Results (α = 0.95, κ sensitivity)
+
+All models share the same architecture and training setup. Test paths are held fixed for fair comparison. VaR and Expected Shortfall (ES) are computed as quantiles of losses (i.e. −P&L), so lower is better.
+
+| κ | MSE Mean | CVaR Mean | MSE ES | CVaR ES | ES Improvement |
+|---|:--------:|:---------:|:------:|:-------:|:--------------:|
+| 0.0   | 0.0000 | 0.0001 | 0.0120 | 0.0109 | +9% |
+| 0.001 | 0.0001 | 0.0000 | 0.0123 | 0.0109 | +11% |
+| 0.005 | 0.0000 | 0.0001 | 0.0114 | 0.0106 | +7% |
+| 0.01  | 0.0001 | −0.0001 | 0.0134 | 0.0127 | +5% |
+| 0.02  | −0.0009 | −0.0001 | 0.0167 | 0.0183 | **−10%** |
+
+### Key Findings
+
+1. **CVaR improves tail risk at low-to-medium TC (κ ≤ 0.01).** Expected Shortfall is reduced by 5–11% relative to MSE. Both hedgers charge fair premiums (mean P&L ≈ 0), so the improvement is purely from better tail-shaping of the hedging strategy.
+
+2. **CVaR reverses at high TC (κ = 0.02), where MSE produces better tail outcomes.** The CVaR model aggressively under-hedges at κ=0.02 (lower delta throughout the path) to avoid paying transaction costs in bad scenarios. But this leaves unhedged exposure that creates larger tail losses when the stock moves sharply. The TC saving is outweighed by unhedged risk.
+
+3. **There is a TC threshold beyond which CVaR tail optimisation is counterproductive.** At low κ the dominant source of tail losses is hedging error; CVaR correctly reduces this. At high κ, TC drag becomes the dominant risk and CVaR avoids it by under-hedging — but unhedged exposure in a directional move is worse.
+
+4. **CVaR models have wider P&L variance than MSE across all κ.** MSE directly minimises variance (since `E[pnl²] = Var + Mean²`); CVaR does not penalise variance on paths outside the tail. The wider variance is the cost paid for better tail outcomes at moderate TC levels.
+
+5. **Both loss functions price fairly.** After applying gradient routing, both MSE and CVaR premiums settle at values giving `E[pnl] ≈ 0`. The comparison is therefore purely about hedging strategy, not premium differences.
+
+---
+
 ## Planned Extensions / TODO
 
 - [x] Kappa sensitivity: train and evaluate at κ ∈ {0.0, 0.001, 0.005, 0.01, 0.02}
 - [x] Quantify TC reduction: total TC paid per path comparison (NN vs BSM)
 - [x] Trade size plots: |Δδ| per step to visualise reduced rebalancing
+- [x] CVaR loss: gradient-routed implementation with multi-κ comparison
 - [ ] Retrain κ=0.02 with more epochs (e.g. 200) to confirm convergence
 - [ ] Heston model: swap GBM paths for Heston paths using existing generator in project/stock/generators.py
-- [ ] CVaR loss: replace MSE with conditional value-at-risk to optimise the left tail directly
 - [ ] Increase N_PATHS_TRAIN for better generalisation at high κ
