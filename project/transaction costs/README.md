@@ -17,6 +17,9 @@ The key insight: BSM delta hedging was derived assuming a frictionless market. W
 | `pricer_cvar.py` | Train CVaR model (single κ), save with `_cvar` suffix |
 | `CVaRTrain.py` | Train CVaR models across all κ values |
 | `CVaREvaluate.py` | Load MSE + CVaR models, produce side-by-side tail risk comparison |
+| `pricer_entropic.py` | Train Entropic Risk Measure model (single κ), save with `_entropic` suffix |
+| `EntropicTrain.py` | Train entropic models across all κ values |
+| `CompareEvaluate.py` | 3-way comparison: MSE vs CVaR vs Entropic across all κ |
 | `README.md` | This file |
 
 **Run order (MSE):**
@@ -25,10 +28,11 @@ python "project/transaction costs/MultiTrain.py"
 python "project/transaction costs/MultiEvaluate.py"
 ```
 
-**Run order (CVaR comparison):**
+**Run order (3-way loss function comparison):**
 ```
 python "project/transaction costs/CVaRTrain.py"
-python "project/transaction costs/CVaREvaluate.py"
+python "project/transaction costs/EntropicTrain.py"
+python "project/transaction costs/CompareEvaluate.py"
 ```
 All scripts must be run from the project root.
 
@@ -225,12 +229,58 @@ All models share the same architecture and training setup. Test paths are held f
 
 ---
 
+## Entropic Risk Measure Extension and 3-Way Comparison
+
+### Motivation
+
+Having established that CVaR α=0.95 improves tail risk at moderate TC but deteriorates at κ=0.02, the natural question is whether a different tail-focused loss function avoids this breakdown. The **Entropic Risk Measure (ERM)** — also known as the certainty equivalent under CARA exponential utility — is theoretically smoother than CVaR because it weights every path continuously by how bad it is, rather than applying a binary weight to the worst α fraction:
+
+```
+ER_γ(pnl) = (1/γ) * log( E[ exp(−γ * pnl) ] )
+```
+
+The intuition: ERM assigns gradient weight `exp(−γ * pnl)` to each path, so bad paths receive exponentially more influence than good ones. γ is the risk aversion parameter (γ→0: risk-neutral; γ→∞: worst-case).
+
+The same gradient routing fix applies: d(ER)/dπ = −1 always, so the premium is detached from the ERM gradient and anchored via a zero-mean penalty independently.
+
+### 3-Way Comparison Results (γ = 100, α = 0.95)
+
+| κ | MSE ES | CVaR ES | Entropic ES | Winner |
+|---|:------:|:-------:|:-----------:|:------:|
+| 0.0   | 0.0120 | **0.0110** | 0.0137 | CVaR |
+| 0.001 | 0.0124 | **0.0111** | 0.0153 | CVaR |
+| 0.005 | 0.0116 | **0.0108** | 0.0156 | CVaR |
+| 0.01  | 0.0135 | **0.0128** | 0.0224 | CVaR |
+| 0.02  | **0.0170** | 0.0184 | 0.0367 | MSE  |
+
+ES = Expected Shortfall at α = 0.95 (lower is better).
+
+### Key Findings
+
+1. **CVaR α=0.95 is the best-performing loss function across κ ≤ 0.01.** It reduces Expected Shortfall by 5–11% relative to MSE. Entropic γ=100 is the worst performer at every single κ value — including κ=0 where there are no transaction costs at all.
+
+2. **Entropic γ=100 is more extreme than CVaR α=0.95, not less.** The intuition that ERM would be smoother than CVaR proved incorrect at this γ. CVaR at α=0.95 gives the worst 5% of paths a weight of 1/(1−0.95) = 20×. The ERM at γ=100 gives a path with pnl=−0.10 a gradient weight of exp(100 × 0.10) = exp(10) ≈ 22,000× relative to a zero-pnl path. On rare extreme paths, the ERM gradient is several orders of magnitude larger than CVaR, causing far more aggressive under-hedging.
+
+3. **The result reveals a non-monotonic relationship between tail-focus intensity and actual tail performance.** Ranking the three loss functions by tail-focus intensity: MSE (none) < CVaR α=0.95 (moderate) < Entropic γ=100 (extreme). But ranking by actual ES at κ=0.005: CVaR (0.0108) < MSE (0.0116) < Entropic (0.0156). The best tail outcome comes from moderate tail focus — too much is as harmful as too little.
+
+4. **Entropic under-hedges more aggressively than CVaR at high κ.** The delta path comparison shows Entropic (green) consistently below CVaR (orange) at κ ≥ 0.005, and far below BSM. The exponential gradient weighting causes the network to abandon hedging even more drastically than CVaR to avoid the worst TC scenarios — creating severe unhedged exposure.
+
+5. **P&L variance ordering: MSE < CVaR < Entropic across all κ.** At κ=0.02 the standard deviations are 0.0081, 0.0097, 0.0173 respectively — Entropic is more than twice as volatile as MSE. This confirms that more tail-focused objectives sacrifice variance control, and at γ=100 the sacrifice is too large.
+
+6. **All three loss functions achieve fair premiums (mean P&L ≈ 0).** The gradient routing fix ensures this for CVaR and Entropic. The comparison is purely about hedging strategy, not pricing.
+
+7. **CVaR α=0.95 remains the recommended loss function for moderate TC.** The 3-way comparison confirms it occupies the best operating point: strong enough tail focus to improve on MSE at realistic κ values, but not so extreme that it abandons hedging quality altogether.
+
+---
+
 ## Planned Extensions / TODO
 
 - [x] Kappa sensitivity: train and evaluate at κ ∈ {0.0, 0.001, 0.005, 0.01, 0.02}
 - [x] Quantify TC reduction: total TC paid per path comparison (NN vs BSM)
 - [x] Trade size plots: |Δδ| per step to visualise reduced rebalancing
 - [x] CVaR loss: gradient-routed implementation with multi-κ comparison
+- [x] Entropic risk measure: 3-way loss function comparison (MSE / CVaR / Entropic)
+- [ ] Tune Entropic γ: find the value where ERM first matches or beats CVaR
 - [ ] Retrain κ=0.02 with more epochs (e.g. 200) to confirm convergence
 - [ ] Heston model: swap GBM paths for Heston paths using existing generator in project/stock/generators.py
 - [ ] Increase N_PATHS_TRAIN for better generalisation at high κ
