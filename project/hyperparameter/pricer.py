@@ -25,7 +25,7 @@ S0 = 1
 K = 1
 sigma = 0.1
 r = 0
-N = 100
+N = 252
 T = 1
 h = T/N
 
@@ -33,10 +33,10 @@ h = T/N
 # hyperparameters
 N_PATHS_TRAIN  = 10_000
 N_PATHS_TEST   = 10_000
-BATCH_SIZE     = 512
-N_EPOCHS       = 20
-LEARNING_RATE  = 3e-3
-CLIP_NORM = 1.0
+BATCH_SIZE     = 1024
+N_EPOCHS       = 50
+LEARNING_RATE  = 0.03
+CLIP_NORM = 2.0
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -48,7 +48,6 @@ class HedgingNet(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(2, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, 1),
@@ -118,7 +117,7 @@ def train(S_train: np.ndarray):
     hedging_net = HedgingNet().to(DEVICE)
 
     optimizer = optim.Adam(hedging_net.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
 
     S_tensor = torch.tensor(S_train.T, dtype=torch.float32)
     dataset  = TensorDataset(S_tensor)
