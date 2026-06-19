@@ -26,7 +26,7 @@ HP = {
 }[REBALANCE]
 
 EPOCHS = 50
-STEP_SIZE, GAMMA = 30, 0.5
+STEP_SIZE, GAMMA = 15, 0.5
 N_TRAIN, N_TEST = 10_000, 10_000
 # -------------------
 
