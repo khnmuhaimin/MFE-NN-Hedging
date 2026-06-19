@@ -1,5 +1,6 @@
-"""Quick check that the tuned base network (moneyness, tau) hedges as well as the BS delta.
-Trains and tests on independent GBM draws. Flip REBALANCE to switch monthly <-> daily."""
+"""Quick check for the feature-engineered network: inputs are moneyness, tau, an all-time realized-vol
+estimate, and a BS delta built from that estimate. Trains and tests on independent GBM draws.
+Flip REBALANCE to switch monthly <-> daily."""
 
 import os
 import numpy as np
@@ -19,10 +20,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---- edit here ----
 REBALANCE = "daily"          # "monthly" or "daily"
 
-# tuned winners per frequency (base feature set)
+# tuned winners per frequency (base_relvol_bsdelta feature set).
+# note: the daily winner below is the seed-fragile one from tuning -- use seed_test.py
+# to pick a robust replacement before trusting a single run here.
 HP = {
-    "monthly": dict(N=12,  hidden=64,  depth=4, lr=0.03, batch_size=512, clip_norm=1.0),
-    "daily":   dict(N=252, hidden=128, depth=4, lr=0.03, batch_size=512, clip_norm=0.5),
+    "monthly": dict(N=12,  hidden=128, depth=4, lr=0.03, batch_size=1024, clip_norm=1.0),
+    "daily":   dict(N=252, hidden=128, depth=4, lr=0.03, batch_size=512,  clip_norm=0.5),
 }[REBALANCE]
 
 EPOCHS = 50
@@ -33,13 +36,13 @@ N_TRAIN, N_TEST = 10_000, 10_000
 S0, K, sigma, r, T = 1, 1, 0.1, 0, 1
 N = HP["N"]
 h = T / N
-TAG = f"base_{REBALANCE}"
+TAG = f"relvol_{REBALANCE}"
 print(f"Using device: {DEVICE}   version: {TAG}  (N={N})")
 
 
 class HedgingNet(nn.Module):
     """Feed-forward delta net; sigmoid output keeps a call delta in [0, 1]."""
-    def __init__(self, input_dim=2, hidden=128, depth=4):
+    def __init__(self, input_dim=4, hidden=128, depth=4):
         super().__init__()
         layers = [nn.Linear(input_dim, hidden), nn.ReLU()]
         for _ in range(depth - 1):
@@ -52,10 +55,34 @@ class HedgingNet(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-def build_state(St, t, batch):
-    """Two inputs: moneyness and time-to-maturity."""
+def realized_vol(S_hist):
+    """Annualized realized vol from the path's whole history so far (all-time, no look-ahead)."""
+    batch, n_obs = S_hist.shape
+    if n_obs < 2:
+        return torch.zeros(batch, device=DEVICE)
+    log_returns = torch.log(S_hist[:, 1:] / S_hist[:, :-1])
+    return log_returns.std(dim=1, unbiased=False) / (h ** 0.5)
+
+
+def bs_delta_feat(St, sigma_hat, tau):
+    """BS delta from the estimated vol, never the true sigma."""
+    sig = torch.clamp(sigma_hat, min=0.01)
+    if tau <= 0:
+        return (St > K).float()
+    d1 = (torch.log(St / K) + (r + 0.5 * sig ** 2) * tau) / (sig * tau ** 0.5)
+    return 0.5 * (1.0 + torch.erf(d1 / (2 ** 0.5)))
+
+
+def build_state(S_hist, t):
+    """Four inputs: moneyness, tau, realized vol, BS delta from realized vol."""
+    batch = S_hist.shape[0]
+    St = S_hist[:, -1]
     tau = 1.0 - t / N
-    return torch.stack([St / K, torch.full((batch,), tau, device=DEVICE)], dim=1)
+    sig = realized_vol(S_hist)
+    return torch.stack([St / K,
+                        torch.full((batch,), tau, device=DEVICE),
+                        sig,
+                        bs_delta_feat(St, sig, tau)], dim=1)
 
 
 def run_paths(S_batch, net):
@@ -66,8 +93,9 @@ def run_paths(S_batch, net):
     prev_delta = torch.zeros(batch, device=DEVICE)
 
     for t in range(N):
-        St = S_batch[:, t]
-        delta = net(build_state(St, t, batch))
+        S_hist = S_batch[:, :t + 1]
+        St = S_hist[:, -1]
+        delta = net(build_state(S_hist, t))
         trade = delta - prev_delta
         currency -= trade * St
         underlying += trade
@@ -93,7 +121,7 @@ def bsm_delta(S, t):
 
 
 def bsm_hedge_pnl(S):
-    """Discrete BS-delta hedge P&L: the benchmark floor."""
+    """Discrete BS-delta hedge P&L: the benchmark floor (uses the true sigma, unlike the feature)."""
     n_paths = S.shape[1]
     currency = np.zeros(n_paths)
     underlying = np.zeros(n_paths)
@@ -115,7 +143,7 @@ def bsm_hedge_pnl(S):
 
 def train(S_train):
     """Train one network on the given paths and return it plus the loss curve."""
-    net = HedgingNet(2, HP["hidden"], HP["depth"]).to(DEVICE)
+    net = HedgingNet(4, HP["hidden"], HP["depth"]).to(DEVICE)
     opt = optim.Adam(net.parameters(), lr=HP["lr"])
     sched = optim.lr_scheduler.StepLR(opt, step_size=STEP_SIZE, gamma=GAMMA)
 
@@ -191,11 +219,11 @@ def evaluate(S_test, net):
 
 def nn_deltas_path(S_path, net):
     net.eval()
+    S = torch.tensor(S_path, dtype=torch.float32, device=DEVICE)
     deltas = np.zeros(N)
     with torch.no_grad():
         for t in range(N):
-            St = torch.tensor([S_path[t]], dtype=torch.float32, device=DEVICE)
-            deltas[t] = net(build_state(St, t, 1)).item()
+            deltas[t] = net(build_state(S[:t + 1].unsqueeze(0), t)).item()
     return deltas
 
 
