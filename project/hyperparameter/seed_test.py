@@ -8,7 +8,7 @@ scenarios. A candidate is flagged unstable if any seed's val_std exceeds BLOWUP_
 import numpy as np
 import torch
 
-import tune
+from project.hyperparameter import tuning as tune
 
 # ---- edit here ----
 FEATURE_SET = "base_relvol_bsdelta"
@@ -18,9 +18,10 @@ REBALANCE = "daily"
 CANDIDATES = [
     tune.HParams(hidden=128, depth=4, lr=0.03, batch_size=512, clip_norm=0.5),   # tuning winner (fragile)
     tune.HParams(hidden=128, depth=4, lr=0.03, batch_size=512, clip_norm=2.0),
-    tune.HParams(hidden=128, depth=3, lr=0.03, batch_size=512, clip_norm=2.0),
-    tune.HParams(hidden=128, depth=4, lr=0.01, batch_size=512, clip_norm=2.0),
-    tune.HParams(hidden=128, depth=3, lr=0.01, batch_size=512, clip_norm=2.0),
+    tune.HParams(hidden=128, depth=4, lr=0.01, batch_size=512, clip_norm=0.5),
+    #tune.HParams(hidden=128, depth=3, lr=0.03, batch_size=512, clip_norm=2.0),
+    #tune.HParams(hidden=128, depth=4, lr=0.01, batch_size=512, clip_norm=2.0),
+    #tune.HParams(hidden=128, depth=3, lr=0.01, batch_size=512, clip_norm=2.0),
 ]
 
 N_SEEDS = 5

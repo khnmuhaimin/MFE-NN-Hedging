@@ -17,7 +17,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- edit here ----
-REBALANCE = "daily"          # "monthly" or "daily"
+REBALANCE = "monthly"          # "monthly" or "daily"
 
 # tuned winners per frequency (base feature set)
 HP = {
