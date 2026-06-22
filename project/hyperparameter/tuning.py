@@ -1,4 +1,18 @@
-"""Hyperparameter tuning for the deep hedging network: 2 feature sets x 2 rebalancing frequencies."""
+"""Hyperparameter tuning for the deep hedging network: 2 feature sets x 2 rebalancing frequencies.
+
+Paths are generated under the methodology's parameter ranges: initial moneyness sampled
+uniformly from [0.85, 1.15], effective volatility from [0.1, 0.3], K=1, r=0, T=1.
+GBM is always simulated at daily resolution (252 steps); the monthly variant rebalances
+at every 21st step while computing features from the full daily history.
+
+Training set: 10k paths. Validation set: 20k paths (both per methodology chapter).
+
+Benchmarks used for scoring:
+  - Base versions:   practitioner BSM with fixed sigma=0.2 (same info as base network)
+  - Relvol versions: practitioner BSM with realised vol   (same info as relvol network)
+
+Step-decay schedule (s=30, gamma=0.5) and zero weight decay are held fixed throughout.
+"""
 
 import dataclasses
 import itertools
@@ -11,196 +25,250 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from scipy.stats import norm
 
-from project.stock.generators import generate_gbm
-
-# fixed problem parameters, never tuned
-S0, K, sigma, r, T = 1, 1, 0.1, 0, 1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ── methodology constants ──────────────────────────────────────────────────────
+K, r, T          = 1.0, 0.0, 1.0
+MONEYNESS_RANGE  = (0.85, 1.15)
+SIGMA_RANGE      = (0.1, 0.3)
+SIGMA_FIXED      = 0.2          # practitioner BSM sigma for base versions
+DAILY_STEPS      = 252
+H_DAILY          = T / DAILY_STEPS
 
-# feature sets: name -> the input columns the network sees
+# fixed schedule — not tuned
+STEP_SIZE        = 30
+GAMMA            = 0.5
+WEIGHT_DECAY     = 0.0
+
+# dataset sizes per methodology chapter
+N_TRAIN          = 10_000
+N_VAL            = 20_000
+VAL_SEED         = 12345
+
+# feature sets
 FEATURE_CONFIGS = {
-    "base": ["moneyness", "tau"],
+    "base":               ["moneyness", "tau"],
     "base_relvol_bsdelta": ["moneyness", "tau", "realized_vol", "bs_delta_feature"],
 }
 
-# rebalancing frequency: name -> number of rebalancing dates over [0, T]
+# rebalancing schedules — always daily resolution, downsampled for monthly
 REBALANCE_CONFIGS = {
     "monthly": 12,
-    "daily": 252,
+    "daily":   252,
 }
 
 
+# ── module-level mutable state (set by configure_version) ─────────────────────
+N            = 12
+REBAL_INDICES = list(range(0, DAILY_STEPS, DAILY_STEPS // 12))
+REBAL_TAUS    = [1.0 - i / DAILY_STEPS for i in REBAL_INDICES]
+FEATURE_NAMES = FEATURE_CONFIGS["base"]
+INPUT_DIM     = 2
+VERSION_NAME  = "base__monthly"
+
+
 def configure_version(feature_set, rebalance_freq):
-    """Switch the whole module to one (feature set, rebalancing frequency) combination."""
-    global N, h, FEATURE_NAMES, INPUT_DIM, VERSION_NAME
+    """Switch the module to one (feature set, rebalancing frequency) combination."""
+    global N, REBAL_INDICES, REBAL_TAUS, FEATURE_NAMES, INPUT_DIM, VERSION_NAME
 
     if feature_set not in FEATURE_CONFIGS:
-        raise ValueError(f"Unknown feature_set '{feature_set}'. Pick from {list(FEATURE_CONFIGS)}.")
+        raise ValueError(f"Unknown feature_set '{feature_set}'. Choose from {list(FEATURE_CONFIGS)}.")
     if rebalance_freq not in REBALANCE_CONFIGS:
-        raise ValueError(f"Unknown rebalance_freq '{rebalance_freq}'. Pick from {list(REBALANCE_CONFIGS)}.")
+        raise ValueError(f"Unknown rebalance_freq '{rebalance_freq}'. Choose from {list(REBALANCE_CONFIGS)}.")
 
+    N             = REBALANCE_CONFIGS[rebalance_freq]
+    stride        = DAILY_STEPS // N
+    REBAL_INDICES = list(range(0, DAILY_STEPS, stride))
+    REBAL_TAUS    = [1.0 - i / DAILY_STEPS for i in REBAL_INDICES]
     FEATURE_NAMES = FEATURE_CONFIGS[feature_set]
-    INPUT_DIM = len(FEATURE_NAMES)
-    N = REBALANCE_CONFIGS[rebalance_freq]
-    h = T / N
-
-    VERSION_NAME = f"{feature_set}__{rebalance_freq}"
-    print(f"[configure_version] {VERSION_NAME}:  features={FEATURE_NAMES}  N={N}  h={h:.5f}")
+    INPUT_DIM     = len(FEATURE_NAMES)
+    VERSION_NAME  = f"{feature_set}__{rebalance_freq}"
+    print(f"[configure_version] {VERSION_NAME}:  features={FEATURE_NAMES}  "
+          f"N={N}  rebal_stride={stride}")
     return VERSION_NAME
 
 
-# default so the module is usable before configure_version is called explicitly
-configure_version("base", "monthly")
+# ── path generation ────────────────────────────────────────────────────────────
+
+def generate_paths(n_paths, seed=None):
+    """GBM paths with random moneyness in [0.85,1.15] and sigma in [0.1,0.3].
+
+    Always simulates DAILY_STEPS=252 daily steps. Returns:
+        S:           (DAILY_STEPS+1, n_paths)
+        sigmas:      (n_paths,)
+        moneynesses: (n_paths,)
+    """
+    rng         = np.random.default_rng(seed)
+    moneynesses = rng.uniform(*MONEYNESS_RANGE, n_paths)
+    sigmas      = rng.uniform(*SIGMA_RANGE, n_paths)
+    Z           = rng.standard_normal((DAILY_STEPS, n_paths))
+    W           = np.cumsum(np.sqrt(H_DAILY) * Z, axis=0)
+    t_grid      = np.arange(1, DAILY_STEPS + 1)[:, None] * H_DAILY
+    log_S       = (np.log(moneynesses)[None, :]
+                   - 0.5 * sigmas[None, :] ** 2 * t_grid
+                   + sigmas[None, :] * W)
+    S_full      = np.concatenate([moneynesses[None, :], np.exp(log_S)], axis=0)
+    return S_full, sigmas, moneynesses
 
 
-def realized_vol_feature(S_hist):
-    """Annualized realized vol from the path's whole history so far (all-time window, no look-ahead)."""
+# ── feature builders ───────────────────────────────────────────────────────────
+
+def realized_vol_feat(S_hist):
+    """Annualised realised vol from the full daily history at this rebalancing date."""
     batch, n_obs = S_hist.shape
     if n_obs < 2:
         return torch.zeros(batch, device=DEVICE)
-    log_returns = torch.log(S_hist[:, 1:] / S_hist[:, :-1])
-    return log_returns.std(dim=1, unbiased=False) / (h ** 0.5)
+    log_ret = torch.log(S_hist[:, 1:] / S_hist[:, :-1])
+    return log_ret.std(dim=1, unbiased=False) / (H_DAILY ** 0.5)
 
 
-def bs_delta_feature(St, sigma_hat, tau):
-    """BS delta built from the estimated vol sigma_hat, never the true simulation sigma."""
-    sigma_safe = torch.clamp(sigma_hat, min=0.01)
+def bs_delta_feat(St, sigma_hat, tau):
+    """BS delta from the realised vol estimate — never the true sigma."""
+    sig = torch.clamp(sigma_hat, min=0.01)
     if tau <= 0:
         return (St > K).float()
-    d1 = (torch.log(St / K) + (r + 0.5 * sigma_safe ** 2) * tau) / (sigma_safe * tau ** 0.5)
+    d1 = (torch.log(St / K) + 0.5 * sig ** 2 * tau) / (sig * tau ** 0.5)
     return 0.5 * (1.0 + torch.erf(d1 / (2 ** 0.5)))
 
 
-def build_state(S_hist, t):
-    """Assemble the (batch, INPUT_DIM) network input for the active feature set."""
+def build_state(S_hist, tau):
+    """Assemble the (batch, INPUT_DIM) input tensor for the active feature set."""
     batch = S_hist.shape[0]
-    St = S_hist[:, -1]
-    tau = 1.0 - t / N
-    sigma_hat = None
+    St    = S_hist[:, -1]
+    tau_t = torch.full((batch,), tau, device=DEVICE)
 
-    cols = []
-    for name in FEATURE_NAMES:
-        if name == "moneyness":
-            cols.append(St / K)
-        elif name == "tau":
-            cols.append(torch.full((batch,), tau, device=DEVICE))
-        elif name == "realized_vol":
-            sigma_hat = realized_vol_feature(S_hist) if sigma_hat is None else sigma_hat
-            cols.append(sigma_hat)
-        elif name == "bs_delta_feature":
-            sigma_hat = realized_vol_feature(S_hist) if sigma_hat is None else sigma_hat
-            cols.append(bs_delta_feature(St, sigma_hat, tau))
-        else:
-            raise ValueError(f"Unknown feature name: {name!r}")
+    if FEATURE_NAMES == ["moneyness", "tau"]:
+        return torch.stack([St / K, tau_t], dim=1)
 
-    return torch.stack(cols, dim=1)
+    # base_relvol_bsdelta
+    sig = realized_vol_feat(S_hist)
+    return torch.stack([St / K, tau_t, sig, bs_delta_feat(St, sig, tau)], dim=1)
 
+
+# ── network ────────────────────────────────────────────────────────────────────
 
 @dataclasses.dataclass
 class HParams:
-    """One hyperparameter configuration."""
-    hidden: int = 64
-    depth: int = 3
-    lr: float = 1e-3
-    batch_size: int = 2048
-    epochs: int = 40
-    step_size: int = 30
-    gamma: float = 0.5
-    clip_norm: float = 1.0
-    weight_decay: float = 0.0
+    hidden:     int   = 64
+    depth:      int   = 3
+    lr:         float = 1e-2
+    batch_size: int   = 512
+    epochs:     int   = 40
+    clip_norm:  float = 1.0
 
 
 class HedgingNet(nn.Module):
-    """Feed-forward delta network; sigmoid output keeps a call delta in [0, 1]."""
-    def __init__(self, hp, input_dim):
+    """Feed-forward delta network; sigmoid output keeps a call delta in (0,1)."""
+    def __init__(self, hp):
         super().__init__()
-        layers = [nn.Linear(input_dim, hp.hidden), nn.ReLU()]
+        layers = [nn.Linear(INPUT_DIM, hp.hidden), nn.ReLU()]
         for _ in range(hp.depth - 1):
             layers += [nn.Linear(hp.hidden, hp.hidden), nn.ReLU()]
-        layers += [nn.Linear(hp.hidden, 1)]
-        self.net = nn.Sequential(*layers)
-        self.out_act = nn.Sigmoid()
+        layers += [nn.Linear(hp.hidden, 1), nn.Sigmoid()]
+        self.net     = nn.Sequential(*layers)
         self.premium = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x):
-        return self.out_act(self.net(x)).squeeze(-1)
+        return self.net(x).squeeze(-1)
 
 
-def run_paths(S_batch, hedging_net):
-    """Roll the hedge forward over all N steps and return terminal P&L per path."""
-    batch = S_batch.shape[0]
-    currency = torch.zeros(batch, device=DEVICE)
+# ── forward pass ───────────────────────────────────────────────────────────────
+
+def run_paths(S_batch, net):
+    """Roll the hedge forward across REBAL_INDICES; S_batch is (batch, DAILY_STEPS+1)."""
+    batch      = S_batch.shape[0]
+    currency   = torch.zeros(batch, device=DEVICE)
     underlying = torch.zeros(batch, device=DEVICE)
     prev_delta = torch.zeros(batch, device=DEVICE)
 
-    for t in range(N):
-        S_hist = S_batch[:, :t + 1]          # only info available at t
-        St = S_hist[:, -1]
-        delta = hedging_net(build_state(S_hist, t))
-
-        trade = delta - prev_delta
-        currency -= trade * St
+    for daily_idx, tau in zip(REBAL_INDICES, REBAL_TAUS):
+        S_hist = S_batch[:, :daily_idx + 1]
+        delta  = net(build_state(S_hist, tau))
+        trade  = delta - prev_delta
+        currency   -= trade * S_hist[:, -1]
         underlying += trade
-        prev_delta = delta
+        prev_delta  = delta
 
-    S_T = S_batch[:, N]
+    S_T    = S_batch[:, DAILY_STEPS]
     payoff = torch.clamp(S_T - K, min=0)
-    return hedging_net.premium + underlying * S_T + currency - payoff
+    return net.premium + underlying * S_T + currency - payoff
 
 
-def bsm_call(S0, K, r, sigma, T):
-    """Black-Scholes call price."""
-    d1 = (np.log(S0 / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    return S0 * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+# ── BSM benchmarks ─────────────────────────────────────────────────────────────
+
+def bsm_call_vec(S0_vec, sigma_vec):
+    d1 = (np.log(S0_vec / K) + 0.5 * sigma_vec ** 2 * T) / (sigma_vec * np.sqrt(T))
+    d2 = d1 - sigma_vec * np.sqrt(T)
+    return S0_vec * norm.cdf(d1) - K * norm.cdf(d2)
 
 
-def bsm_delta(S, K, r, sigma, t, T):
-    """Black-Scholes call delta at time t."""
+def bsm_delta_vec(S, sigma_vec, t):
     tau = T - t
     if tau <= 0:
         return np.where(S > K, 1.0, 0.0)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * tau) / (sigma * np.sqrt(tau))
+    d1 = (np.log(S / K) + 0.5 * sigma_vec ** 2 * tau) / (sigma_vec * np.sqrt(tau))
     return norm.cdf(d1)
 
 
-def bsm_hedge_pnl(S):
-    """Discrete delta-hedge P&L under the exact BS delta: the benchmark floor."""
-    n_paths = S.shape[1]
-    currency = np.zeros(n_paths)
+def realized_vol_np(S_hist_np):
+    """Numpy realised vol for use in the practitioner BSM benchmark."""
+    if S_hist_np.shape[0] < 2:
+        return np.zeros(S_hist_np.shape[1])
+    log_ret = np.log(S_hist_np[1:] / S_hist_np[:-1])
+    return log_ret.std(axis=0, ddof=0) / (H_DAILY ** 0.5)
+
+
+def practitioner_bsm_pnl(S, moneynesses, feature_set):
+    """Practitioner BSM benchmark — uses the same information as the network.
+
+    Base versions:   fixed sigma=0.2 with average premium across paths.
+    Relvol versions: realised vol at each rebalancing date with average premium.
+    """
+    n_paths    = S.shape[1]
+    currency   = np.zeros(n_paths)
     underlying = np.zeros(n_paths)
     prev_delta = np.zeros(n_paths)
-    premium = bsm_call(S0, K, r, sigma, T)
 
-    for t in range(N):
-        St = S[t, :]
-        delta = bsm_delta(St, K, r, sigma, t * h, T)
+    if feature_set == "base":
+        sigma_arr = np.full(n_paths, SIGMA_FIXED)
+        premium   = float(bsm_call_vec(moneynesses, sigma_arr).mean())
+    else:
+        # relvol: no history at t=0, use fallback
+        sigma_arr = np.full(n_paths, 0.01)
+        premium   = float(bsm_call_vec(moneynesses, np.full(n_paths, SIGMA_FIXED)).mean())
+
+    for daily_idx in REBAL_INDICES:
+        if feature_set == "base":
+            sig_use = sigma_arr
+        else:
+            rv      = realized_vol_np(S[:daily_idx + 1, :])
+            sig_use = np.clip(rv, 0.01, None)
+
+        St    = S[daily_idx, :]
+        delta = bsm_delta_vec(St, sig_use, daily_idx * H_DAILY)
         trade = delta - prev_delta
-        currency -= trade * St
+        currency   -= trade * St
         underlying += trade
-        currency *= np.exp(r * h)
-        prev_delta = delta
+        prev_delta  = delta
 
-    S_T = S[N, :]
-    payoff = np.maximum(S_T - K, 0)
-    return premium + underlying * S_T + currency - payoff
+    S_T = S[DAILY_STEPS, :]
+    return premium + underlying * S_T + currency - np.maximum(S_T - K, 0)
 
+
+# ── training ───────────────────────────────────────────────────────────────────
 
 def train_one_config(hp, S_train, S_val):
-    """Train one config on the given paths; score by validation P&L std (isolates hedging from the premium)."""
-    net = HedgingNet(hp, INPUT_DIM).to(DEVICE)
-    opt = optim.Adam(net.parameters(), lr=hp.lr, weight_decay=hp.weight_decay)
-    sched = optim.lr_scheduler.StepLR(opt, step_size=hp.step_size, gamma=hp.gamma)
+    """Train one HP config; score by validation P&L std (isolates hedge quality from premium)."""
+    net  = HedgingNet(hp).to(DEVICE)
+    opt  = optim.Adam(net.parameters(), lr=hp.lr, weight_decay=WEIGHT_DECAY)
+    sched = optim.lr_scheduler.StepLR(opt, step_size=STEP_SIZE, gamma=GAMMA)
 
     S_tensor = torch.tensor(S_train.T, dtype=torch.float32)
-    loader = DataLoader(TensorDataset(S_tensor), batch_size=hp.batch_size, shuffle=True)
-    val_tensor = torch.tensor(S_val.T, dtype=torch.float32).to(DEVICE)
+    loader   = DataLoader(TensorDataset(S_tensor), batch_size=hp.batch_size, shuffle=True)
+    val_t    = torch.tensor(S_val.T, dtype=torch.float32).to(DEVICE)
 
-    best_val_std = float("inf")
-    history = []
-
+    best_val = float("inf")
     for epoch in range(hp.epochs):
         net.train()
         for (S_batch,) in loader:
@@ -214,187 +282,103 @@ def train_one_config(hp, S_train, S_val):
 
         net.eval()
         with torch.no_grad():
-            val_std = run_paths(val_tensor, net).std().item()
-        history.append(val_std)
-        best_val_std = min(best_val_std, val_std)
+            val_std = run_paths(val_t, net).std().item()
+        best_val = min(best_val, val_std)
 
-    return net, best_val_std, history
-
-
-# wide random-search grid; lr range pushed up because sigmoid gradients are weaker than tanh
-DEFAULT_SEARCH_SPACE = {
-    "hidden": [32, 64, 128],
-    "depth": [2, 3, 4],
-    "lr": [3e-4, 1e-3, 3e-3, 1e-2, 3e-2],
-    "batch_size": [512, 1024, 2048],
-    "step_size": [20, 30, 50],
-    "gamma": [0.3, 0.5, 0.7],
-    "clip_norm": [0.5, 1.0, 2.0],
-}
+    return net, best_val
 
 
-def random_search(n_trials=20, seed=0, epochs=40, space=None):
-    """Score n_trials random configs from space against the BSM floor, under the active version."""
-    space = space or DEFAULT_SEARCH_SPACE
-    rng = random.Random(seed)
-
-    print(f"Simulating shared train/val path sets for '{VERSION_NAME}' (N={N})...")
-    S_train = generate_gbm(S0, r, sigma, h, 8_000, N + 1)
-    S_val = generate_gbm(S0, r, sigma, h, 2_000, N + 1)
-    bsm_std = bsm_hedge_pnl(S_val).std()
-    print(f"BSM benchmark std on the validation set: {bsm_std:.4f}\n")
-
-    results = []
-    for i in range(n_trials):
-        sampled = {k: rng.choice(v) for k, v in space.items()}
-        hp = HParams(**sampled, epochs=epochs)
-
-        torch.manual_seed(0)        # same init every trial so we compare hyperparameters, not noise
-        _, val_std, _ = train_one_config(hp, S_train, S_val)
-        gap = val_std - bsm_std
-
-        print(f"[{i + 1}/{n_trials}] val_std={val_std:.4f}  gap_vs_bsm={gap:+.4f}  {hp}")
-        results.append((hp, val_std, gap))
-
-    results.sort(key=lambda row: row[1])
-    print(f"\nTop 5 for '{VERSION_NAME}' by validation std:")
-    for hp, val_std, gap in results[:5]:
-        print(f"  val_std={val_std:.4f}  gap={gap:+.4f}  {hp}")
-
-    return results
+def confirm_with_seeds(hp, S_train, S_val, n_seeds=5):
+    """Retrain the winning config across seeds to confirm the result is not an initialisation artifact."""
+    scores = []
+    for seed in range(n_seeds):
+        torch.manual_seed(seed)
+        _, val_std = train_one_config(hp, S_train, S_val)
+        print(f"    seed {seed}: val_std={val_std:.5f}")
+        scores.append(val_std)
+    arr = np.array(scores)
+    print(f"    mean={arr.mean():.5f}  std_across_seeds={arr.std():.5f}")
+    return arr
 
 
-# narrowed grids, one per rebalancing frequency (32 / 16 combos); lr does most of the discriminating
-MONTHLY_GRID_SEARCH_SPACE = {
-    "hidden": [64, 128],
-    "depth": [3, 4],
-    "lr": [1e-2, 3e-2],
+# ── search grids ───────────────────────────────────────────────────────────────
+# Step-decay schedule (s=30, gamma=0.5) and weight decay=0 are held fixed.
+# Daily width is fixed at 128 because the ~21x cost per epoch makes wider searches
+# too expensive and 128 was dominant in preliminary work.
+
+MONTHLY_GRID = {
+    "hidden":     [64, 128],
+    "depth":      [3, 4],
+    "lr":         [1e-2, 3e-2],
     "batch_size": [512, 1024],
-    "step_size": [30],
-    "gamma": [0.5],
-    "clip_norm": [1.0, 2.0],
-}
+    "clip_norm":  [1.0, 2.0],
+}   # 2^5 = 32 combinations
 
-DAILY_GRID_SEARCH_SPACE = {
-    "hidden": [128],            # fixed: ~21x cost per epoch and clearly dominant in the daily log
-    "depth": [3, 4],
-    "lr": [1e-2, 3e-2],
+DAILY_GRID = {
+    "hidden":     [128],
+    "depth":      [3, 4],
+    "lr":         [1e-2, 3e-2],
     "batch_size": [512, 1024],
-    "step_size": [30],
-    "gamma": [0.5],
-    "clip_norm": [0.5, 2.0],
-}
+    "clip_norm":  [0.5, 1.0],
+}   # 2^4 = 16 combinations
 
 
-def grid_search(space, epochs=40):
-    """Exhaustive search over an explicitly passed grid; same scoring and fixed init as random_search."""
-    keys = list(space.keys())
+# ── grid search ────────────────────────────────────────────────────────────────
+
+def grid_search(feature_set, rebalance_freq, epochs=40, n_seeds=5):
+    """Full grid search for one (feature_set, rebalance_freq) version."""
+    configure_version(feature_set, rebalance_freq)
+
+    space  = MONTHLY_GRID if rebalance_freq == "monthly" else DAILY_GRID
+    keys   = list(space.keys())
     combos = list(itertools.product(*[space[k] for k in keys]))
 
-    print(f"Simulating shared train/val path sets for '{VERSION_NAME}' (N={N})...")
-    S_train = generate_gbm(S0, r, sigma, h, 8_000, N + 1)
-    S_val = generate_gbm(S0, r, sigma, h, 2_000, N + 1)
-    bsm_std = bsm_hedge_pnl(S_val).std()
-    print(f"BSM benchmark std on the validation set: {bsm_std:.4f}")
+    print(f"\nGenerating train ({N_TRAIN:,}) and validation ({N_VAL:,}) sets...")
+    torch.manual_seed(0)
+    S_train, _, mon_train = generate_paths(N_TRAIN, seed=0)
+    S_val,   _, mon_val   = generate_paths(N_VAL,   seed=VAL_SEED)
+
+    prac_std = practitioner_bsm_pnl(S_val, mon_val, feature_set).std()
+    print(f"Practitioner BSM std on validation set: {prac_std:.5f}")
     print(f"Grid has {len(combos)} combinations.\n")
 
     results = []
     for i, combo in enumerate(combos):
-        hp = HParams(**dict(zip(keys, combo)), epochs=epochs)
-
+        hp  = HParams(**dict(zip(keys, combo)), epochs=epochs)
         torch.manual_seed(0)
-        _, val_std, _ = train_one_config(hp, S_train, S_val)
-        gap = val_std - bsm_std
-
-        print(f"[{i + 1}/{len(combos)}] val_std={val_std:.4f}  gap_vs_bsm={gap:+.4f}  {hp}")
+        _, val_std = train_one_config(hp, S_train, S_val)
+        gap = val_std - prac_std
+        print(f"  [{i + 1:>3}/{len(combos)}] val_std={val_std:.5f}  "
+              f"gap_vs_prac={gap:+.5f}  {hp}")
         results.append((hp, val_std, gap))
 
     results.sort(key=lambda row: row[1])
-    print(f"\nTop 5 for '{VERSION_NAME}' by validation std:")
+    print(f"\nTop 5 for '{VERSION_NAME}':")
     for hp, val_std, gap in results[:5]:
-        print(f"  val_std={val_std:.4f}  gap={gap:+.4f}  {hp}")
+        print(f"  val_std={val_std:.5f}  gap={gap:+.5f}  {hp}")
+
+    best_hp = results[0][0]
+    print(f"\nConfirming best config across {n_seeds} seeds...")
+    confirm_with_seeds(best_hp, S_train, S_val, n_seeds=n_seeds)
 
     return results
 
 
-def optuna_search(n_trials=30, epochs=40):
-    """Optional Optuna search, more sample-efficient than the random/grid drivers."""
-    import optuna  # pip install optuna --break-system-packages
-
-    S_train = generate_gbm(S0, r, sigma, h, 8_000, N + 1)
-    S_val = generate_gbm(S0, r, sigma, h, 2_000, N + 1)
-    bsm_std = bsm_hedge_pnl(S_val).std()
-
-    def objective(trial):
-        hp = HParams(
-            hidden=trial.suggest_categorical("hidden", [32, 64, 128]),
-            depth=trial.suggest_int("depth", 2, 4),
-            lr=trial.suggest_float("lr", 1e-4, 5e-2, log=True),
-            batch_size=trial.suggest_categorical("batch_size", [512, 1024, 2048]),
-            step_size=trial.suggest_int("step_size", 15, 50),
-            gamma=trial.suggest_float("gamma", 0.2, 0.8),
-            clip_norm=trial.suggest_float("clip_norm", 0.3, 2.0),
-            epochs=epochs,
-        )
-        torch.manual_seed(0)
-        _, val_std, _ = train_one_config(hp, S_train, S_val)
-        return val_std
-
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=n_trials)
-
-    print(f"'{VERSION_NAME}' BSM benchmark std: {bsm_std:.4f}")
-    print(f"Best val_std found: {study.best_value:.4f}")
-    print("Best hyperparameters:", study.best_params)
-    return study
-
-
-def confirm_with_multiple_seeds(hp, n_seeds=5):
-    """Retrain the winning config across seeds to check the win is real, not luck."""
-    S_train = generate_gbm(S0, r, sigma, h, 8_000, N + 1)
-    S_val = generate_gbm(S0, r, sigma, h, 2_000, N + 1)
-
-    scores = []
-    for seed in range(n_seeds):
-        torch.manual_seed(seed)
-        _, val_std, _ = train_one_config(hp, S_train, S_val)
-        print(f"  seed {seed}: val_std={val_std:.4f}")
-        scores.append(val_std)
-
-    scores = np.array(scores)
-    print(f"mean={scores.mean():.4f}  std_across_seeds={scores.std():.4f}")
-    return scores
-
-
-def run_all_versions(n_trials_per_version=20, epochs=40):
-    """Independent random search for every (feature set, rebalancing frequency) pair."""
-    all_results = {}
-    for feature_set in FEATURE_CONFIGS:
-        for rebalance_freq in REBALANCE_CONFIGS:
-            version_name = configure_version(feature_set, rebalance_freq)
-            print(f"\n{'=' * 70}\nVERSION: {version_name}\n{'=' * 70}")
-            all_results[version_name] = random_search(n_trials=n_trials_per_version, epochs=epochs)
-    return all_results
-
+# ── main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # versions to sweep this run: (feature_set, rebalance_freq)
     VERSIONS_TO_RUN = [
-        ("base", "monthly"),
-        ("base", "daily"),
+        ("base",               "monthly"),
+        ("base",               "daily"),
         ("base_relvol_bsdelta", "monthly"),
         ("base_relvol_bsdelta", "daily"),
     ]
 
+    all_results = {}
     for feature_set, rebalance_freq in VERSIONS_TO_RUN:
-        configure_version(feature_set, rebalance_freq)
-        print(f"\n{'=' * 70}\nVERSION: {VERSION_NAME}\n{'=' * 70}")
-
-        space = MONTHLY_GRID_SEARCH_SPACE if rebalance_freq == "monthly" else DAILY_GRID_SEARCH_SPACE
-        results = grid_search(space=space)
-        best_hp, _, _ = results[0]
-
-        print(f"\nConfirming the top config for '{VERSION_NAME}' across seeds...")
-        confirm_with_multiple_seeds(best_hp, n_seeds=5)
-
-    # run_all_versions(n_trials_per_version=20)  # rerun every version from scratch in one call
+        print(f"\n{'=' * 70}")
+        print(f"VERSION: {feature_set}__{rebalance_freq}")
+        print(f"{'=' * 70}")
+        all_results[f"{feature_set}__{rebalance_freq}"] = grid_search(
+            feature_set, rebalance_freq, epochs=40, n_seeds=5
+        )
