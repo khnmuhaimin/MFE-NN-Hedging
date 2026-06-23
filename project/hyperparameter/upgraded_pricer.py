@@ -7,9 +7,11 @@ daily resolution (252 steps); for the monthly variant the hedge rebalances at ev
 21st daily step while realized vol is computed from the full daily history available
 at that point. Flip REBALANCE to switch monthly <-> daily.
 
-The BSM benchmark uses the true per-path sigma (oracle). This network has access to
-realized vol as a feature, so it is expected to close the gap to the oracle floor
-that the base model leaves open.
+Benchmarks:
+  - Practitioner BSM (realised vol): fair comparison — same information as the network
+  - Oracle BSM (true per-path sigma): theoretical upper bound
+
+Hyperparameters are the winning configurations from the grid search in tuning.py.
 """
 
 import os
@@ -28,14 +30,15 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---- edit here ----
 REBALANCE = "daily"          # "monthly" or "daily"
 
+# winning configurations from tuning.py grid search
 HP = {
-    "monthly": dict(N=12,  hidden=128, depth=4, lr=0.03, batch_size=1024, clip_norm=1.0),
-    "daily":   dict(N=252, hidden=128, depth=4, lr=0.03, batch_size=512,  clip_norm=0.5),
+    "monthly": dict(N=12,  hidden=64,  depth=4, lr=0.01, batch_size=1024, clip_norm=1.0),
+    "daily":   dict(N=252, hidden=128, depth=3, lr=0.01, batch_size=1024, clip_norm=0.5),
 }[REBALANCE]
 
 EPOCHS = 100
 STEP_SIZE, GAMMA = 30, 0.5
-N_TRAIN, N_TEST = 10_000, 10_000
+N_TRAIN, N_TEST = 10_000, 20_000
 # -------------------
 
 # market parameters (fixed by the methodology)
@@ -56,6 +59,7 @@ assert len(REBAL_INDICES) == N
 
 TAG = f"relvol_{REBALANCE}"
 print(f"Using device: {DEVICE}   version: {TAG}  (N={N}, daily_steps={DAILY_STEPS})")
+print(f"Hyperparameters: {HP}")
 
 
 class HedgingNet(nn.Module):
@@ -74,15 +78,20 @@ class HedgingNet(nn.Module):
 
 
 def realized_vol(S_hist):
-    """Annualised realized vol from the full daily history up to this rebalancing date.
-    Returns zero when fewer than 2 prices are available.
-    The network learns that this feature is uninformative early in the path.
-    """
+    """Annualised realized vol from the full daily history up to this rebalancing date."""
     batch, n_obs = S_hist.shape
     if n_obs < 2:
         return torch.zeros(batch, device=DEVICE)
     log_returns = torch.log(S_hist[:, 1:] / S_hist[:, :-1])
     return log_returns.std(dim=1, unbiased=False) / (H_DAILY ** 0.5)
+
+
+def realized_vol_np(S_hist_np):
+    """Numpy version of realized_vol for use in the practitioner BSM benchmark."""
+    if S_hist_np.shape[0] < 2:
+        return np.zeros(S_hist_np.shape[1])
+    log_returns = np.log(S_hist_np[1:] / S_hist_np[:-1])
+    return log_returns.std(axis=0, ddof=0) / (H_DAILY ** 0.5)
 
 
 def bs_delta_feat(St, sigma_hat, tau):
@@ -108,11 +117,7 @@ def build_state(S_hist, tau):
 
 
 def run_paths(S_batch, net):
-    """Roll the hedge forward, rebalancing only at REBAL_INDICES.
-
-    S_batch has shape (batch, DAILY_STEPS+1). Realized vol at each rebalancing
-    date is computed from the full daily history up to that point.
-    """
+    """Roll the hedge forward, rebalancing only at REBAL_INDICES."""
     batch      = S_batch.shape[0]
     currency   = torch.zeros(batch, device=DEVICE)
     underlying = torch.zeros(batch, device=DEVICE)
@@ -132,13 +137,7 @@ def run_paths(S_batch, net):
 
 
 def generate_paths(n_paths, seed=None):
-    """Generate n_paths daily GBM trajectories with random initial moneyness and sigma.
-
-    Returns:
-        S: (DAILY_STEPS+1, n_paths) array of daily prices
-        sigmas: (n_paths,) true volatilities used per path
-        moneynesses: (n_paths,) initial moneynesses (= S_0 since K=1)
-    """
+    """Generate n_paths daily GBM trajectories with random initial moneyness and sigma."""
     rng         = np.random.default_rng(seed)
     moneynesses = rng.uniform(*MONEYNESS_RANGE, n_paths)
     sigmas      = rng.uniform(*SIGMA_RANGE, n_paths)
@@ -154,14 +153,12 @@ def generate_paths(n_paths, seed=None):
 
 
 def bsm_call_vec(S0_vec, sigma_vec):
-    """BSM call price, vectorised over S0 and sigma."""
     d1 = (np.log(S0_vec / K) + 0.5 * sigma_vec ** 2 * T) / (sigma_vec * np.sqrt(T))
     d2 = d1 - sigma_vec * np.sqrt(T)
     return S0_vec * norm.cdf(d1) - K * norm.cdf(d2)
 
 
 def bsm_delta_vec(S, sigma_vec, t):
-    """BSM call delta, vectorised over S and sigma."""
     tau = T - t
     if tau <= 0:
         return np.where(S > K, 1.0, 0.0)
@@ -169,8 +166,8 @@ def bsm_delta_vec(S, sigma_vec, t):
     return norm.cdf(d1)
 
 
-def bsm_hedge_pnl(S, sigmas, moneynesses):
-    """Oracle BSM hedge using each path's TRUE sigma."""
+def oracle_bsm_hedge_pnl(S, sigmas, moneynesses):
+    """Oracle BSM: uses true per-path sigma and per-path premium (unachievable in practice)."""
     n_paths    = S.shape[1]
     currency   = np.zeros(n_paths)
     underlying = np.zeros(n_paths)
@@ -187,6 +184,35 @@ def bsm_hedge_pnl(S, sigmas, moneynesses):
 
     S_T = S[DAILY_STEPS, :]
     return premiums + underlying * S_T + currency - np.maximum(S_T - K, 0)
+
+
+def practitioner_bsm_hedge_pnl(S, moneynesses):
+    """Practitioner BSM: uses realised vol at each rebalancing date and a single average premium.
+    
+    This is the fair benchmark for the relvol model — same information as the network.
+    """
+    n_paths    = S.shape[1]
+    currency   = np.zeros(n_paths)
+    underlying = np.zeros(n_paths)
+    prev_delta = np.zeros(n_paths)
+
+    # single premium: average BSM price using sigma=0.2 as a reasonable a-priori estimate
+    sigma_arr = np.full(n_paths, 0.2)
+    premium   = float(bsm_call_vec(moneynesses, sigma_arr).mean())
+
+    for daily_idx in REBAL_INDICES:
+        S_hist_np = S[:daily_idx + 1, :]
+        rv        = realized_vol_np(S_hist_np)
+        rv_safe   = np.clip(rv, 0.01, None)
+        St        = S[daily_idx, :]
+        delta     = bsm_delta_vec(St, rv_safe, daily_idx * H_DAILY)
+        trade     = delta - prev_delta
+        currency   -= trade * St
+        underlying += trade
+        prev_delta = delta
+
+    S_T = S[DAILY_STEPS, :]
+    return premium + underlying * S_T + currency - np.maximum(S_T - K, 0)
 
 
 def train(S_train):
@@ -276,10 +302,7 @@ def diagnose_features(S_test, sigmas, net):
 
 
 def diagnose_delta_by_sigma(S_test, sigmas, net):
-    """Check whether the network outputs different deltas for different sigma paths
-    at ATM moneyness. If corr(NN delta, true sigma) ~ 0, the network is ignoring
-    the vol signal entirely and outputting an average delta like the base model.
-    """
+    """Check whether the network outputs different deltas for different sigma paths."""
     print("\n=== Delta sensitivity to sigma (ATM paths only) ===")
     atm_mask = np.abs(S_test[0, :] - 1.0) < 0.05
     if atm_mask.sum() < 100:
@@ -301,24 +324,16 @@ def diagnose_delta_by_sigma(S_test, sigmas, net):
         with torch.no_grad():
             deltas = net(build_state(S_hist, tau)).cpu().numpy()
 
-        corr = np.corrcoef(deltas, sig_atm)[0, 1] if deltas.std() > 0 else float("nan")
-
-        # oracle BSM delta at ATM for each sigma
-        St_np = S_atm[daily_idx, :]
-        oracle_deltas = bsm_delta_vec(St_np, sig_atm, daily_idx * H_DAILY)
-        oracle_corr   = np.corrcoef(oracle_deltas, sig_atm)[0, 1]
+        corr           = np.corrcoef(deltas, sig_atm)[0, 1] if deltas.std() > 0 else float("nan")
+        St_np          = S_atm[daily_idx, :]
+        oracle_deltas  = bsm_delta_vec(St_np, sig_atm, daily_idx * H_DAILY)
+        oracle_corr    = np.corrcoef(oracle_deltas, sig_atm)[0, 1]
 
         print(f"  day={daily_idx:>3d}  "
               f"corr(NN_delta, sigma)={corr:+.3f}  "
               f"corr(oracle_delta, sigma)={oracle_corr:+.3f}  "
               f"NN_delta_std={deltas.std():.3f}  "
               f"oracle_delta_std={oracle_deltas.std():.3f}")
-
-    print(f"\n  Interpretation:")
-    print(f"  If corr(NN_delta, sigma) ~ corr(oracle_delta, sigma), the network")
-    print(f"  is correctly using the vol signal.")
-    print(f"  If corr(NN_delta, sigma) ~ 0 while oracle corr is high, the network")
-    print(f"  is ignoring the vol signal and outputting an average delta.")
 
 
 def evaluate(S_test, sigmas, moneynesses, net):
@@ -327,31 +342,39 @@ def evaluate(S_test, sigmas, moneynesses, net):
         nn_pnl = run_paths(
             torch.tensor(S_test.T, dtype=torch.float32).to(DEVICE), net
         ).cpu().numpy()
-    bsm_pnl        = bsm_hedge_pnl(S_test, sigmas, moneynesses)
-    mean_bsm_price = bsm_call_vec(moneynesses, sigmas).mean()
-    unhedged       = net.premium.item() - np.maximum(S_test[DAILY_STEPS, :] - K, 0)
+
+    oracle_pnl       = oracle_bsm_hedge_pnl(S_test, sigmas, moneynesses)
+    practitioner_pnl = practitioner_bsm_hedge_pnl(S_test, moneynesses)
+    unhedged         = net.premium.item() - np.maximum(S_test[DAILY_STEPS, :] - K, 0)
+    mean_bsm_price   = bsm_call_vec(moneynesses, sigmas).mean()
 
     pcts = [1, 5, 25, 75, 95, 99]
-    print("\n" + "=" * 56)
-    print(f"  {'':18s}{'NN':>12}{'BSM (oracle)':>14}")
-    print("  " + "-" * 44)
-    print(f"  {'mean pnl':18s}{nn_pnl.mean():>12.4f}{bsm_pnl.mean():>14.4f}")
-    print(f"  {'std pnl':18s}{nn_pnl.std():>12.4f}{bsm_pnl.std():>14.4f}")
-    for p, a, b in zip(pcts, np.percentile(nn_pnl, pcts), np.percentile(bsm_pnl, pcts)):
-        print(f"  {'P' + str(p):18s}{a:>12.4f}{b:>14.4f}")
+    print("\n" + "=" * 70)
+    print(f"  {'':18s}{'NN':>12}{'BSM (prac.)':>14}{'BSM (oracle)':>14}")
+    print("  " + "-" * 58)
+    for label, fn in [("mean pnl", np.mean), ("std pnl", np.std)]:
+        print(f"  {label:18s}{fn(nn_pnl):>12.4f}{fn(practitioner_pnl):>14.4f}"
+              f"{fn(oracle_pnl):>14.4f}")
+    for p in pcts:
+        print(f"  {'P' + str(p):18s}{np.percentile(nn_pnl, p):>12.4f}"
+              f"{np.percentile(practitioner_pnl, p):>14.4f}"
+              f"{np.percentile(oracle_pnl, p):>14.4f}")
     print(f"  {'mean bsm price':18s}{mean_bsm_price:>12.4f}")
     print(f"  {'learned premium':18s}{net.premium.item():>12.4f}")
-    gap = nn_pnl.std() - bsm_pnl.std()
-    print("  " + "-" * 44)
-    print(f"  std gap vs oracle BSM: {gap:+.4f}")
-    print(f"  ({'matches oracle floor' if abs(gap) < 5e-4 else 'above oracle floor'})")
-    print("=" * 56)
+    print("  " + "-" * 58)
+    gap_prac   = nn_pnl.std() - practitioner_pnl.std()
+    gap_oracle = nn_pnl.std() - oracle_pnl.std()
+    print(f"  std gap vs practitioner BSM: {gap_prac:+.4f}  "
+          f"({'NN wins' if gap_prac < 0 else 'BSM wins'})")
+    print(f"  std gap vs oracle BSM:       {gap_oracle:+.4f}")
+    print("=" * 70)
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4), sharey=True)
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4), sharey=True)
     fig.suptitle(f"Terminal P&L  ({TAG})", fontsize=13)
     for ax, data, title in zip(
-        axes, [nn_pnl, bsm_pnl, unhedged],
-        ["Deep hedge (relvol)", "BS delta hedge (oracle)", "Unhedged"]
+        axes,
+        [nn_pnl, practitioner_pnl, oracle_pnl, unhedged],
+        ["Deep hedge (relvol)", "BSM (prac., rv)", "BSM (oracle)", "Unhedged"]
     ):
         ax.hist(data, bins=50, alpha=0.8)
         ax.axvline(data.mean(), color="red", linestyle="--", linewidth=1.1,
@@ -393,24 +416,34 @@ def plot_delta_paths(S_test, sigmas, net):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     fig.suptitle(f"Delta path: NN vs BS  ({TAG})", fontsize=13)
     for ax, i, label in zip(axes, idx, ["in-the-money", "out-of-the-money"]):
-        path = S_test[:, i]
-        sig  = sigmas[i]
+        path      = S_test[:, i]
+        sig_true  = sigmas[i]
         nn_deltas = nn_deltas_path(path, net)
-        bs_deltas = []
-        for daily_idx in REBAL_INDICES:
-            tau = T - daily_idx * H_DAILY
-            if tau <= 0:
-                bs_deltas.append(float(path[daily_idx] > K))
+        oracle_deltas = [
+            bsm_delta_vec(np.array([path[d]]), np.array([sig_true]), d * H_DAILY)[0]
+            if d * H_DAILY < T else float(path[d] > K)
+            for d in REBAL_INDICES
+        ]
+        prac_deltas = []
+        for d in REBAL_INDICES:
+            rv_d = realized_vol_np(path[:d + 1].reshape(-1, 1))[0] if d >= 1 else 0.01
+            rv_d = max(rv_d, 0.01)
+            tau_d = T - d * H_DAILY
+            if tau_d <= 0:
+                prac_deltas.append(float(path[d] > K))
             else:
-                d1 = (np.log(path[daily_idx] / K) + 0.5 * sig ** 2 * tau) / (sig * np.sqrt(tau))
-                bs_deltas.append(norm.cdf(d1))
-        ax.plot(rebal_times, nn_deltas, label="NN (relvol)", linewidth=1.2)
-        ax.plot(rebal_times, bs_deltas, label=f"BS ($\\sigma={sig:.2f}$)",
+                d1 = (np.log(path[d] / K) + 0.5 * rv_d ** 2 * tau_d) / (rv_d * np.sqrt(tau_d))
+                prac_deltas.append(norm.cdf(d1))
+
+        ax.plot(rebal_times, nn_deltas,     label="NN (relvol)",                linewidth=1.2)
+        ax.plot(rebal_times, oracle_deltas, label=f"BS oracle ($\\sigma={sig_true:.2f}$)",
                 linewidth=1.2, linestyle="--")
+        ax.plot(rebal_times, prac_deltas,   label="BS prac. (rv)",
+                linewidth=1.2, linestyle=":")
         ax.set_title(f"{label}  ($S_0$={path[0]:.3f}, $S_T$={path[DAILY_STEPS]:.3f})")
         ax.set_xlabel("time")
         ax.set_ylabel("delta")
-        ax.legend(fontsize=9)
+        ax.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(os.path.join(SCRIPT_DIR, f"delta_{TAG}.png"), dpi=150, bbox_inches="tight")
     plt.close()
