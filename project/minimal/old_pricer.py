@@ -34,7 +34,17 @@ N_EPOCHS       = 100
 LEARNING_RATE  = 1e-3
 
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Dynamically assign the best available accelerator
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = torch.device("xpu")
+else:
+    DEVICE = torch.device("cpu")
+
 print(f"Using device: {DEVICE}")
 
 
