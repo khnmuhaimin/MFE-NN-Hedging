@@ -54,6 +54,7 @@ DAILY_GRID = {
     "clip_norm": [0.5, 1.0],
 }
 
+# set the global config for one (feature set, rebalancing frequency) combo
 def configure_version(feature_set, rebalance_freq):
     global N, REBAL_INDICES, REBAL_TAUS, FEATURE_NAMES, INPUT_DIM, VERSION_NAME
 
@@ -66,10 +67,11 @@ def configure_version(feature_set, rebalance_freq):
     VERSION_NAME = f"{feature_set}__{rebalance_freq}"
     print(f"[configure_version] {VERSION_NAME}:  features={FEATURE_NAMES}  "
           f"N={N}  rebal_stride={stride}")
-    
+
     return VERSION_NAME
 
-def generate_paths(n_paths, seed=None):
+# simulate GBM paths with random moneyness in [0.85,1.15] and sigma in [0.1,0.3]
+def make_paths(n_paths, seed=None):
 
     rng = np.random.default_rng(seed)
     moneynesses = rng.uniform(*MONEYNESS_RANGE, n_paths)
@@ -84,6 +86,7 @@ def generate_paths(n_paths, seed=None):
 
     return S_full, sigmas, moneynesses
 
+# annualised realised vol from the price history so far (torch, for the network)
 def realized_vol_feat(S_hist):
 
     batch, n_obs = S_hist.shape
@@ -94,6 +97,7 @@ def realized_vol_feat(S_hist):
     return log_ret.std(dim=1, unbiased=False)/(H_DAILY**0.5)
 
 
+# Black-Scholes delta from the realised-vol estimate, never the true sigma
 def bs_delta_feat(St, sigma_hat, tau):
 
     sig = torch.clamp(sigma_hat, min=0.01)
@@ -104,7 +108,8 @@ def bs_delta_feat(St, sigma_hat, tau):
     return 0.5*(1.0 + torch.erf(d1/(2**0.5)))
 
 
-def build_state(S_hist, tau):
+# stack the chosen input features into one (batch, INPUT_DIM) tensor
+def make_inputs(S_hist, tau):
 
     batch = S_hist.shape[0]
     St = S_hist[:, -1]
@@ -115,8 +120,9 @@ def build_state(S_hist, tau):
 
     return torch.stack([St/K, tau_t, sig, bs_delta_feat(St, sig, tau)], dim=1)
 
+# all the tunable hyperparameters for one training run
 @dataclasses.dataclass
-class HParams:
+class hyper_params:
     hidden: int = 64
     depth: int = 3
     lr: float = 1e-2
@@ -124,7 +130,9 @@ class HParams:
     epochs: int = 40
     clip_norm: float = 1.0
 
-class HedgingNet(nn.Module):
+# feed-forward delta network; sigmoid output keeps a call delta in (0,1)
+class hedger_NN(nn.Module):
+    # build the layer stack from the hyperparameters
     def __init__(self, hp):
         super().__init__()
         layers = [nn.Linear(INPUT_DIM, hp.hidden), nn.ReLU()]
@@ -134,10 +142,12 @@ class HedgingNet(nn.Module):
         self.net = nn.Sequential(*layers)
         self.premium = nn.Parameter(torch.tensor(0.0))
 
+    # forward pass: inputs -> hedge ratio (delta)
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
-def run_paths(S_batch, net):
+# step the hedge portfolio through every rebalancing date and return terminal P&L
+def roll_hedge(S_batch, net):
 
     batch = S_batch.shape[0]
     currency = torch.zeros(batch, device=DEVICE)
@@ -146,7 +156,7 @@ def run_paths(S_batch, net):
 
     for daily_idx, tau in zip(REBAL_INDICES, REBAL_TAUS):
         S_hist = S_batch[:, :daily_idx + 1]
-        delta = net(build_state(S_hist, tau))
+        delta = net(make_inputs(S_hist, tau))
         trade = delta - prev_delta
         currency -= trade*S_hist[:, -1]
         underlying += trade
@@ -157,6 +167,7 @@ def run_paths(S_batch, net):
 
     return net.premium + underlying*S_T + currency - payoff
 
+# vectorised Black-Scholes call price
 def bsm_call_vec(S0_vec, sigma_vec):
 
     d1 = (np.log(S0_vec/K) + 0.5*sigma_vec**2*T)/(sigma_vec*np.sqrt(T))
@@ -164,6 +175,7 @@ def bsm_call_vec(S0_vec, sigma_vec):
 
     return S0_vec*norm.cdf(d1) - K*norm.cdf(d2)
 
+# vectorised Black-Scholes delta at time t
 def bsm_delta_vec(S, sigma_vec, t):
 
     tau = T - t
@@ -173,6 +185,7 @@ def bsm_delta_vec(S, sigma_vec, t):
 
     return norm.cdf(d1)
 
+# annualised realised vol from price history (numpy, for the benchmark)
 def realized_vol_np(S_hist_np):
 
     if S_hist_np.shape[0] < 2:
@@ -181,6 +194,7 @@ def realized_vol_np(S_hist_np):
 
     return log_ret.std(axis=0, ddof=0)/(H_DAILY**0.5)
 
+# benchmark P&L using the same info the network sees (fixed sigma, or realised vol)
 def practitioner_bsm_pnl(S, moneynesses, feature_set):
 
     n_paths = S.shape[1]
@@ -212,9 +226,10 @@ def practitioner_bsm_pnl(S, moneynesses, feature_set):
 
     return premium + underlying*S_T + currency - np.maximum(S_T - K, 0)
 
+# train one hyperparameter config; return the net and its best validation P&L std
 def train_one_config(hp, train_t, val_t):
 
-    net = HedgingNet(hp).to(DEVICE)
+    net = hedger_NN(hp).to(DEVICE)
     opt = optim.Adam(net.parameters(), lr=hp.lr, weight_decay=WEIGHT_DECAY)
     sched = optim.lr_scheduler.StepLR(opt, step_size=STEP_SIZE, gamma=GAMMA)
     loader = DataLoader(TensorDataset(train_t), batch_size=hp.batch_size, shuffle=True)
@@ -224,18 +239,19 @@ def train_one_config(hp, train_t, val_t):
         for (S_batch,) in loader:
             S_batch = S_batch.to(DEVICE)
             opt.zero_grad()
-            loss = (run_paths(S_batch, net)**2).mean()
+            loss = (roll_hedge(S_batch, net)**2).mean()
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), hp.clip_norm)
             opt.step()
         sched.step()
         net.eval()
         with torch.no_grad():
-            val_std = run_paths(val_t, net).std().item()
+            val_std = roll_hedge(val_t, net).std().item()
         best_val = min(best_val, val_std)
 
     return net, best_val
 
+# retrain the winning config across seeds to check it isn't an initialisation fluke
 def confirm_with_seeds(hp, train_t, val_t, n_seeds=5):
 
     scores = []
@@ -249,6 +265,7 @@ def confirm_with_seeds(hp, train_t, val_t, n_seeds=5):
 
     return arr
 
+# run the full grid search for one version and confirm the best across seeds
 def grid_search(feature_set, rebalance_freq, epochs=40, n_seeds=5):
 
     configure_version(feature_set, rebalance_freq)
@@ -257,8 +274,8 @@ def grid_search(feature_set, rebalance_freq, epochs=40, n_seeds=5):
     combos = list(itertools.product(*[space[k] for k in keys]))
     print(f"\nGenerating train ({N_TRAIN:,}) and validation ({N_VAL:,}) sets...")
     torch.manual_seed(0)
-    S_train, _, _ = generate_paths(N_TRAIN, seed=0)
-    S_val, _, mon_val = generate_paths(N_VAL, seed=VAL_SEED)
+    S_train, _, _ = make_paths(N_TRAIN, seed=0)
+    S_val, _, mon_val = make_paths(N_VAL, seed=VAL_SEED)
     train_t = torch.tensor(S_train.T, dtype=torch.float32)
     val_t = torch.tensor(S_val.T, dtype=torch.float32).to(DEVICE)
     prac_std = practitioner_bsm_pnl(S_val, mon_val, feature_set).std()
@@ -267,7 +284,7 @@ def grid_search(feature_set, rebalance_freq, epochs=40, n_seeds=5):
 
     results = []
     for i, combo in enumerate(combos):
-        hp = HParams(**dict(zip(keys, combo)), epochs=epochs)
+        hp = hyper_params(**dict(zip(keys, combo)), epochs=epochs)
         torch.manual_seed(0)
         _, val_std = train_one_config(hp, train_t, val_t)
         gap = val_std - prac_std
@@ -288,7 +305,7 @@ def grid_search(feature_set, rebalance_freq, epochs=40, n_seeds=5):
 
 # MAIN programme run
 if __name__ == "__main__":
-    
+
     VERSIONS_TO_RUN = [
         ("base", "monthly"),
         ("base", "daily"),
