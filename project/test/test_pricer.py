@@ -425,7 +425,7 @@ def generate_and_plot_pnl_cloud_grid():
             y = pnl_data[key]
             
             # Draw the scattering points (Tiny size 's' and soft transparency 'alpha' are critical)
-            ax.scatter(x, y, color=colors[model], alpha=0.3, s=1, edgecolors='none')
+            ax.scatter(x, y, color=colors[model], alpha=0.7, s=1, edgecolors='none')
             
             # Ground-truth guide markers
             ax.axhline(0.0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
@@ -457,7 +457,216 @@ def generate_and_plot_pnl_cloud_grid():
     print(f"6-plot PnL cloud matrix successfully saved to: {plot_save_path}")
 
 
+def plot_delta_curves():
+    """
+    Plots Delta vs Underlying Asset Price for BSM, 2-Input NN, and 4-Input NN
+    at a mid-horizon snapshot to illustrate structural decision differences.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.style.use('seaborn-v0_8-whitegrid')
+    
+    # 1. Create a clean synthetic sweep of underlying stock prices (scaled to reference)
+    S_sweep = np.linspace(50, 150, 500)
+    S_scaled_sweep = S_sweep / 100.0 # Match S/K units inside the models
+    
+    # Define fixed mid-horizon parameters
+    t_snapshot = 0.5 * T
+    sigma_ref = 0.25 # Use training midpoint volatility as reference
+    
+    # 2. Calculate Analytical BSM Delta Curve
+    bsm_deltas = [bsm_delta(S, 1.0, 0.0, sigma_ref, t_snapshot, T) for S in S_scaled_sweep]
+    
+    # 3. Extract Neural Network Delta Curves
+    # Load daily models for maximum resolution
+    device = get_torch_device()
+    net_base = load_model("base_daily").to(device)
+    net_4in = load_model("base_relvol_bsdelta_daily").to(device)
+    net_base.eval()
+    net_4in.eval()
+    
+    base_deltas = []
+    four_input_deltas = []
+    
+    with torch.no_grad():
+        for S_norm in S_scaled_sweep:
+            # Construct feature tensors matching your sequential inputs
+            # Base NN features: [S_scaled, t]
+            feat_base = torch.tensor([[S_norm, t_snapshot]], dtype=torch.float32).to(device)
+            # 4-Input NN features: [S_scaled, t, realized_vol, bsm_delta]
+            d_bsm = bsm_delta(S_norm, 1.0, 0.0, sigma_ref, t_snapshot, T)
+            feat_4in = torch.tensor([[S_norm, t_snapshot, sigma_ref, d_bsm]], dtype=torch.float32).to(device)
+            
+            # Extract models' internal delta outputs directly
+            base_deltas.append(net_base(feat_base).cpu().item())
+            four_input_deltas.append(net_4in(feat_4in).cpu().item())
+            
+    # 4. Plotting Phase
+    plt.plot(S_sweep, bsm_deltas, color="#ff7f0e", linewidth=2.0, label="BSM Benchmark (Analytical)")
+    plt.plot(S_sweep, four_input_deltas, color="#aec7e8", linewidth=2.0, linestyle="--", label="Extended NN (4-Input)")
+    plt.plot(S_sweep, base_deltas, color="#1f77b4", linewidth=2.0, linestyle=":", label="Base NN (2-Input)")
+    
+    # Layout and reference markers
+    plt.axvline(100.0, color='red', linestyle='--', linewidth=1.0, alpha=0.5, label='Strike (K=100)')
+    plt.title(f"Hedging Delta ($\Delta$) Profile Comparison (Snapshot at $t = {t_snapshot}$)", fontsize=13, fontweight='bold')
+    plt.xlabel("Current Stock Price ($S_t$)", fontsize=11)
+    plt.ylabel("Hedging Delta ($\Delta_t$)", fontsize=11)
+    plt.ylim([-0.05, 1.05])
+    plt.legend(loc="upper left", frameon=True, fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    # Save directly to your figures repository directory
+    plot_save_path = project_path("results/figures/delta_curve_comparison.png")
+    plt.tight_layout()
+    plt.savefig(plot_save_path, dpi=300)
+    plt.show()
+    print(f"Delta profile curve comparison successfully saved to: {plot_save_path}")
+
+def load_model(model_name) -> HedgingNet:
+    path        = project_path(f"results/models/{model_name}_hedging_model.pt")
+    device = get_torch_device()
+    checkpoint  = torch.load(path, map_location=device)
+    
+    params = get_model_params(model_name)
+    hedging_net = HedgingNet(
+        params["N_FEATURES"],
+        params["HIDDEN_NEURONS"],
+        params["HIDDEN_LAYERS"],
+        params["ACTIVATION_PARAM"]
+        ).to(device)
+    
+    hedging_net.load_state_dict(checkpoint["hedging_net_state"])
+    return hedging_net
+
+def plot_premium_curves():
+    """
+    Plots the initial Option Premium (C_0) vs Strike Price (K) from 80 to 120
+    by extracting the optimized nn.Parameter straight from the model instances.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.style.use('seaborn-v0_8-whitegrid')
+    
+    # 1. Sweep across the specified Strike Price range
+    K_sweep = np.linspace(80, 120, 100)
+    
+    # Reference parameter states at t=0
+    sigma_ref = 0.2  # Midpoint training volatility reference
+    
+    # 2. Calculate Analytical BSM Premium Curve
+    # bsm_call expects (S, K, r, sigma, T) -> normalize S relative to K sweep
+    bsm_premiums = [bsm_call(S0 / K, 1.0, 0, sigma_ref, T) * K for K in K_sweep]
+    
+    # 3. Extract Neural Network Pricing Curves
+    device = get_torch_device()
+    net_base = load_model("base_daily").to(device)
+    net_4in = load_model("base_relvol_bsdelta_daily").to(device)
+    
+    net_base.eval()
+    net_4in.eval()
+    
+    base_premiums = []
+    four_input_premiums = []
+    
+    # Extract the scalar parameters directly
+    # Multiplying by K maps it back from normalized state space to absolute cash terms
+    for K in K_sweep:
+        p_base = net_base.premium.item() * K
+        p_4in = net_4in.premium.item() * K
+        
+        base_premiums.append(p_base)
+        four_input_premiums.append(p_4in)
+            
+    # 4. Plotting Phase
+    plt.plot(K_sweep, bsm_premiums, color="#ff7f0e", linewidth=2.2, label="BSM Model (Analytical)")
+    plt.plot(K_sweep, four_input_premiums, color="#aec7e8", linewidth=2.0, linestyle="--", label="Extended NN (4-Input Daily)")
+    plt.plot(K_sweep, base_premiums, color="#1f77b4", linewidth=2.0, linestyle=":", label="Base NN (2-Input Daily)")
+    
+    # Formatting and structural markers
+    plt.axvline(S0, color='red', linestyle='--', linewidth=1.0, alpha=0.5, label=f'At-The-Money (S0={S0})')
+    plt.title("Initial Option Premium ($C_0$) vs. Strike Price ($K$)", fontsize=13, fontweight='bold')
+    plt.xlabel("Strike Price ($K$)", fontsize=11)
+    plt.ylabel("Option Premium ($C_0$ in Cash Units)", fontsize=11)
+    plt.xlim([80, 120])
+    plt.legend(loc="upper right", frameon=True, fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    # Save output to the correct figures path
+    plot_save_path = project_path("results/figures/option_pricing_curves.png")
+    plt.tight_layout()
+    plt.savefig(plot_save_path, dpi=300)
+    plt.show()
+    print(f"Premium pricing curve successfully saved to: {plot_save_path}")
+
+
+
+def plot_premium_curves_vs_S0():
+    """
+    Plots the initial Option Premium (C_0) vs Initial Stock Price (S0) from 80 to 120
+    keeping Strike Price (K) fixed at 100.0 for clean visual interpretation.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.style.use('seaborn-v0_8-whitegrid')
+    
+    # 1. Fixed parameters according to specifications
+    K_fixed = 100.0
+    sigma_ref = 0.2  # Fixed volatility reference
+    r_ref = 0.0      # Matches your BSM call evaluation (r=0)
+    T_ref = T        # Uses your global/defined Time to Maturity
+    
+    # Sweep across the specified Initial Stock Price range
+    S0_sweep = np.linspace(80, 120, 100)
+    
+    # 2. Calculate Analytical BSM Premium Curve vs S0
+    bsm_premiums = [bsm_call(S0, K_fixed, r_ref, sigma_ref, T_ref) for S0 in S0_sweep]
+    print(max(bsm_premiums), min(bsm_premiums))
+    
+    # 3. Extract Neural Network Pricing Curves
+    device = get_torch_device()
+    net_base = load_model("base_daily").to(device)
+    net_4in = load_model("base_relvol_bsdelta_daily").to(device)
+    
+    net_base.eval()
+    net_4in.eval()
+    
+    base_premiums = []
+    four_input_premiums = []
+    
+    # Extract optimized scalar parameters and scale them with fixed K=100
+    # to maintain consistency with the model's learned scaling factor
+    p_base_scalar = net_base.premium.item() * K_fixed
+    p_4in_scalar = net_4in.premium.item() * K_fixed
+    
+    for S0 in S0_sweep:
+        # Since the network optimized a singular parameter anchor for initialization,
+        # we map its cash-unit representation across the underlying price space.
+        base_premiums.append(p_base_scalar * (S0 / K_fixed))
+        four_input_premiums.append(p_4in_scalar * (S0 / K_fixed))
+            
+    # 4. Plotting Phase (Single set of axes)
+    plt.plot(S0_sweep, bsm_premiums, color="#ff7f0e", linewidth=2.2, label="BSM Model (Analytical)")
+    plt.plot(S0_sweep, four_input_premiums, color="#aec7e8", linewidth=2.0, linestyle="--", label="Extended NN (4-Input Daily)")
+    plt.plot(S0_sweep, base_premiums, color="#1f77b4", linewidth=2.0, linestyle=":", label="Base NN (2-Input Daily)")
+    
+    # Formatting and structural markers
+    plt.axvline(K_fixed, color='red', linestyle='--', linewidth=1.0, alpha=0.5, label=f'At-The-Money (K={K_fixed})')
+    plt.title("Initial Option Premium ($C_0$) vs. Initial Stock Price ($S_0$)", fontsize=13, fontweight='bold')
+    plt.xlabel("Initial Stock Price ($S_0$)", fontsize=11)
+    plt.ylabel("Option Premium ($C_0$ in Cash Units)", fontsize=11)
+    plt.xlim([80, 120])
+    plt.legend(loc="upper left", frameon=True, fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    # Save output to the correct figures path
+    plot_save_path = project_path("results/figures/option_pricing_curves_vs_S0.png")
+    plt.tight_layout()
+    plt.savefig(plot_save_path, dpi=300)
+    plt.show()
+    print(f"Premium pricing curve successfully saved to: {plot_save_path}")
+
+
+
 # print(test_model(MODEL_NAME))
 # print(test_bsm_model("base_daily"))
 # generate_and_plot_distributions()
-generate_and_plot_pnl_cloud_grid()
+# generate_and_plot_pnl_cloud_grid()
+# plot_delta_curves()
+plot_premium_curves_vs_S0()

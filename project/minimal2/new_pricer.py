@@ -2,12 +2,7 @@
 Deep Hedging - Option Pricing & Replication via Neural Networks
 Based on Buehler et al. (2018) "Deep Hedging"
 
-Uses generate_gbm_augmented, which returns a single (paths, timesteps, 4)
-float32 tensor ready for PyTorch.  Feature layout:
-    [:, :, 0]  S_t / K          (normalised price)
-    [:, :, 1]  time to maturity
-    [:, :, 2]  realised vol
-    [:, :, 3]  BS delta
+Modified for dual-network pricing and architecture constraints.
 """
 
 import numpy as np
@@ -23,8 +18,13 @@ from project.stock.generators import generate_gbm_augmented
 from project.helpers.path_helpers import project_path
 from project.helpers.helpers import get_torch_device
 from project.minimal.constants import S0, K_LO, K_HI, SIGMA_LO, SIGMA_HI, T, get_model_params
-from project.minimal.model import HedgingNet
+
+# Updated Model import according to requirements
+from project.minimal2.model import HedgingNet2
 from project.minimal.model_name import MODEL_NAME
+
+# Append '2' to output file naming architectures to prevent overrides
+MODEL_NAME_OUT = f"{MODEL_NAME}2"
 
 os.makedirs(project_path("results/figures"), exist_ok=True)
 os.makedirs(project_path("results/models"), exist_ok=True)
@@ -48,23 +48,14 @@ N = 0
 H = 0
 locals().update(get_model_params(MODEL_NAME))
 
+# Hardcoded script assumptions (Assignment architecture constraints)
+PRICING_HIDDEN_NEURONS = 32
+PRICING_HIDDEN_LAYERS = 2
 
 # ── Device selection ──────────────────────────────────────────────────────────
 DEVICE = get_torch_device()
 print(f"Using device: {DEVICE}")
     
-
-# ── Weight Initializaation ──────────────────────────────────────────────────────────────────────
-# def init_weights_he(m):
-#     # Check if the module is a linear layer
-#     if isinstance(m, nn.Linear):
-#         # Apply Kaiming normal to weights
-#         nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-        
-#         # Initialize biases to 0 to prevent initial shifts
-#         if m.bias is not None:
-#             nn.init.zeros_(m.bias)
-
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
@@ -77,10 +68,10 @@ def loss_function(pnl: torch.Tensor) -> torch.Tensor:
 
 def run_paths(
     features_batch: torch.Tensor,
-    hedging_net: HedgingNet,
+    hedging_net: HedgingNet2,
 ) -> torch.Tensor:
     """
-    Roll out the hedging strategy for one mini-batch.
+    Roll out the hedging strategy and extract dynamic pricing.
 
     Parameters
     ----------
@@ -96,13 +87,24 @@ def run_paths(
     batch   = features_batch.shape[0]
     n_steps = features_batch.shape[1] - 1   # = N
 
-    currency   = torch.zeros(batch, device=DEVICE)
+    # 1. Premium Injection at t=0
+    # S_0 / K is extracted from index 0 at timestep 0
+    initial_moneyness = features_batch[:, 0, [0]]  # Shape: (batch, 1)
+    # print("Moneyness", initial_moneyness.shape)
+    
+    # Query pricing network using the traffic routing flag
+    premium = hedging_net(initial_moneyness, is_initial=True) # Shape: (batch,)
+    # print("premium", premium.shape)
+
+    # Initialize accounting ledgers
+    currency   = premium.clone() # Initial account value = Upfront Option Premium Charged
     underlying = torch.zeros(batch, device=DEVICE)
     prev_delta = torch.zeros(batch, device=DEVICE)
 
+    # 2. Sequential Daily Hedging Execution
     for t in range(n_steps):
         state     = features_batch[:, t, :]    # (batch, N_FEATURES)
-        delta     = hedging_net(state)          # (batch,)
+        delta     = hedging_net(state, is_initial=False) # (batch,)
         St_scaled = features_batch[:, t, 0]    # S_t / K
 
         trade      = delta - prev_delta
@@ -110,12 +112,16 @@ def run_paths(
         underlying += trade
         prev_delta  = delta
 
-    # Terminal payoff in S/K units  (strike normalised to 1)
+    # 3. Terminal Settlement Evaluation (strike normalized to 1)
     S_T_scaled = features_batch[:, -1, 0]
     payoff     = torch.clamp(S_T_scaled - 1.0, min=0.0)
 
-    # pnl = hedging_net.premium + underlying * S_T_scaled + currency - payoff
+    # Final Total Portfolio P&L Wealth Equation
     pnl = underlying * S_T_scaled + currency - payoff
+
+    # plt.hist(pnl.cpu().detach().numpy() if hasattr(pnl, "cpu") else pnl, bins=50)
+    # plt.show() # Blocks and pauses execution until closed
+
     return pnl
 
 
@@ -129,26 +135,34 @@ def train(features_train: torch.Tensor):
 
     Returns
     -------
-    hedging_net  : trained HedgingNet
+    hedging_net  : trained HedgingNet2
     epoch_losses : list[float]
     """
     dataset = TensorDataset(features_train)
     loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    hedging_net = HedgingNet(N_FEATURES, HIDDEN_NEURONS, HIDDEN_LAYERS, ACTIVATION_PARAM).to(DEVICE)
-    # hedging_net.apply(init_weights_he)
+    # Initialize unified custom class incorporating parameter signature requirements
+    hedging_net = HedgingNet2(
+        hedging_features=N_FEATURES, 
+        hedging_hidden_neurons=HIDDEN_NEURONS, 
+        hedging_depth=HIDDEN_LAYERS, 
+        gamma=ACTIVATION_PARAM,
+        pricing_hidden_neurons=PRICING_HIDDEN_NEURONS,
+        pricing_depth=PRICING_HIDDEN_LAYERS
+    ).to(DEVICE)
 
+    # Optimizer tracks parameters for BOTH pricing and hedging networks automatically
     optimizer = optim.Adam(
         hedging_net.parameters(), 
         lr=LEARNING_RATE, 
-        betas=(0.9, 0.999),  # beta1 and beta2
-        eps=1e-8             # epsilon to prevent division by zero
+        betas=(0.9, 0.999),  
+        eps=1e-8             
     )
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
 
-    print(f"\n{'─'*70}")
-    print(f"{'Epoch':>6}  {'Loss':>12}  {'Mean P&L':>12}  {'Std P&L':>10}  {'Premium':>10}")
-    print(f"{'─'*70}")
+    print(f"\n{'─'*75}")
+    print(f"{'Epoch':>6}  {'Loss':>12}  {'Mean P&L':>12}  {'Std P&L':>10}  {'Avg Premium':>14}")
+    print(f"{'─'*75}")
 
     epoch_losses = []
 
@@ -174,14 +188,20 @@ def train(features_train: torch.Tensor):
             hedging_net.eval()
             with torch.no_grad():
                 n_eval  = min(2_000, features_train.shape[0])
-                pnl_all = run_paths(features_train[:n_eval].to(DEVICE), hedging_net)
+                F_eval  = features_train[:n_eval].to(DEVICE)
+                pnl_all = run_paths(F_eval, hedging_net)
+                
+                # Dynamically sample average batch pricing output for logging verification
+                initial_moneyness_eval = F_eval[:, 0, [0]]
+                avg_premium_eval = hedging_net(initial_moneyness_eval, is_initial=True).mean().item()
+                
             print(
                 f"{epoch:>6}  {epoch_losses[-1]:>12.6f}  "
                 f"{pnl_all.mean().item():>12.6f}  {pnl_all.std().item():>10.6f}  "
-                f"{hedging_net.premium.item():>10.6f}"
+                f"{avg_premium_eval:>14.6f}"
             )
 
-    print(f"{'─'*70}\n")
+    print(f"{'─'*75}\n")
     return hedging_net, epoch_losses
 
 
@@ -197,74 +217,51 @@ def bsm_delta(S, K, r, sigma, t, T):
     tau = T - t
     if np.isscalar(tau) and tau <= 0:
         return np.where(S > K, 1.0, 0.0)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * tau) \
-         / (sigma * np.sqrt(np.maximum(tau, 1e-8)))
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) \
+         * tau) / (sigma * np.sqrt(np.maximum(tau, 1e-8)))
     return norm.cdf(d1)
 
 
 def bsm_hedge_pnl(features: torch.Tensor, sigmas: np.ndarray, bsm_deltas: np.ndarray) -> np.ndarray:
-    """
-    Realistic BSM delta hedge benchmark.
-    Uses the historical rolling realized volatilities/deltas available at each step 
-    rather than perfect lookahead knowledge of the true path volatility.
-    """
-    # S/K values: (paths, N+1) -> transpose to (N+1, paths) for sequential looping
-    S_scaled = features[:, :, 0].numpy().T   # Shape: (N+1, paths)
+    """Realistic BSM delta hedge benchmark."""
+    S_scaled = features[:, :, 0].numpy().T   
     n_paths  = S_scaled.shape[1]
-
-    # bsm_deltas shape is (paths, N) -> transpose to (N, paths) to align with time loops
-    deltas_matrix = bsm_deltas.T             # Shape: (N, paths)
+    deltas_matrix = bsm_deltas.T             
 
     currency   = np.zeros(n_paths)
     underlying = np.zeros(n_paths)
     prev_delta = np.zeros(n_paths)
     
-    # 1. Premium calculation
-    # For a realistic baseline, we price the initial option using the true sigma 
-    # (implied vol at t=0), or you can use your training midpoint here.
+    # Baseline benchmark assumes true implied vol paths at t=0
     premium = bsm_call(1.0, 1.0, 0, sigmas, T) 
+    currency += premium
 
-    # 2. Dynamic Rebalancing Loop
     for t in range(N):
         St = S_scaled[t, :]
-        
-        # Pull the realistic delta directly from your pre-computed array
         delta = deltas_matrix[t, :]
         
         trade       = delta - prev_delta
         currency   -= trade * St
         underlying += trade
-        currency   *= np.exp(0 * H)
         prev_delta  = delta
 
-    # 3. Final Settlement at Expiry
     S_T    = S_scaled[N, :]
     payoff = np.maximum(S_T - 1.0, 0.0)
-    pnl    = premium + underlying * S_T + currency - payoff
+    pnl    = underlying * S_T + currency - payoff
     
     return pnl
 
 
 # ── Evaluation / plotting ─────────────────────────────────────────────────────
 
-def get_nn_deltas(features_path: torch.Tensor, hedging_net: HedgingNet) -> np.ndarray:
-    """
-    NN delta at each of the N rebalancing steps for a single path.
-
-    Parameters
-    ----------
-    features_path : (N+1, N_FEATURES)
-
-    Returns
-    -------
-    deltas : (N,)
-    """
+def get_nn_deltas(features_path: torch.Tensor, hedging_net: HedgingNet2) -> np.ndarray:
+    """NN delta at each of the N rebalancing steps for a single path."""
     hedging_net.eval()
     deltas = np.zeros(N)
     with torch.no_grad():
         for t in range(N):
-            state     = features_path[t].unsqueeze(0).to(DEVICE)   # (1, N_FEATURES)
-            deltas[t] = hedging_net(state).item()
+            state     = features_path[t].unsqueeze(0).to(DEVICE)   
+            deltas[t] = hedging_net(state, is_initial=False).item()
     return deltas
 
 
@@ -275,18 +272,14 @@ def plot_learning_curve(epoch_losses: list) -> None:
     ax.set_ylabel("Loss")
     ax.set_title("Training Loss (Learning Curve)")
     plt.tight_layout()
-    plt.savefig(project_path(f"results/figures/{MODEL_NAME}_learning_curve.png"), dpi=150, bbox_inches="tight")
+    plt.savefig(project_path(f"results/figures/{MODEL_NAME_OUT}_learning_curve.png"), dpi=150, bbox_inches="tight")
     plt.close()
     print("Learning curve saved.")
 
 
-def plot_delta_paths(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_deltas, hedging_net: HedgingNet) -> None:
-    """
-    NN vs BSM delta over time for one ITM and one OTM path.
-
-    features_test : (paths, N+1, N_FEATURES)
-    """
-    S_T = features_test[:, -1, 0].numpy()   # terminal S/K for all paths
+def plot_delta_paths(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_deltas, hedging_net: HedgingNet2) -> None:
+    """NN vs BSM delta over time for one ITM and one OTM path."""
+    S_T = features_test[:, -1, 0].numpy()   
     itm_candidates = np.where(S_T > 1.05)[0]
     otm_candidates = np.where(S_T < 0.95)[0]
 
@@ -302,14 +295,8 @@ def plot_delta_paths(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_de
     fig.suptitle("Delta Hedge Path: NN vs BSM", fontsize=13)
 
     for ax, idx, label in zip(axes, [itm_idx, otm_idx], ["In-the-Money", "Out-of-the-Money"]):
-        fp         = features_test[idx]           # (N+1, N_FEATURES)
+        fp         = features_test[idx]           
         nn_deltas  = get_nn_deltas(fp, hedging_net)
-        # bsm_path_deltas = np.zeros(N)
-        # for t in range(N):
-        #     St = fp[t, 0].item()           # Current S_t / K value
-        #     bsm_path_deltas[t] = bsm_delta(
-        #         S=St, K=1.0, r=R, sigma=Sigma_test[idx], t=t * H, T=T
-        #     )
         bsm_path_deltas = bsm_deltas[idx, :]
 
         ax.plot(times, nn_deltas,  label="NN hedge",  linewidth=1.2)
@@ -320,29 +307,26 @@ def plot_delta_paths(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_de
         ax.legend(fontsize=9)
 
     plt.tight_layout()
-    plt.savefig(project_path(f"results/figures/{MODEL_NAME}_delta_paths.png"), dpi=150, bbox_inches="tight")
+    plt.savefig(project_path(f"results/figures/{MODEL_NAME_OUT}_delta_paths.png"), dpi=150, bbox_inches="tight")
     plt.close()
     print("Delta path plot saved.")
 
 
-def test(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_deltas, hedging_net: HedgingNet) -> dict:
-    """
-    Evaluate the trained network on held-out paths.
-
-    features_test : (paths, N+1, N_FEATURES)
-
-    Returns a dict of test statistics for logging.
-    """
+def test(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_deltas, hedging_net: HedgingNet2) -> dict:
+    """Evaluate the trained network on held-out paths."""
     hedging_net.eval()
 
     with torch.no_grad():
         pnl    = run_paths(features_test.to(DEVICE), hedging_net)
         pnl_np = pnl.cpu().numpy()
 
-    S_T          = features_test[:, -1, 0].numpy()   # terminal S/K
+    S_T          = features_test[:, -1, 0].numpy()   
     payoffs      = np.maximum(S_T - 1.0, 0.0)
     bsm_pnl      = bsm_hedge_pnl(features_test, Sigma_test, bsm_deltas)
-    unhedged_pnl = hedging_net.premium.item() - payoffs
+
+    with torch.no_grad():
+        initial_moneyness_test = features_test[:, 0, [0]].to(DEVICE)
+        learned_premiums_test = hedging_net(initial_moneyness_test, is_initial=True).cpu().numpy()
 
     percentiles = [1, 5, 25, 75, 95, 99]
     nn_pcts     = np.percentile(pnl_np, percentiles)
@@ -357,7 +341,7 @@ def test(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_deltas, hedgin
     print(f"  {'Std P&L':35s}  {pnl_np.std():>10.6f}  {bsm_pnl.std():>10.6f}")
     for p, nn_v, bsm_v in zip(percentiles, nn_pcts, bsm_pcts):
         print(f"  {f'P{p}':35s}  {nn_v:>10.6f}  {bsm_v:>10.6f}")
-    print(f"\n  {'Learned premium (S/K units)':35s}  {hedging_net.premium.item():>10.6f}")
+    print(f"\n  {'Mean Learned premium (S/K units)':35s}  {learned_premiums_test.mean():>10.6f}")
     print(f"  {'BSM ATM price (sigma=0.20)':35s}  {bsm_call(1.0, 1.0, 0, 0.20, T):>10.6f}")
     print("=" * 70)
 
@@ -379,7 +363,7 @@ def test(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_deltas, hedgin
         ax.legend(fontsize=9)
 
     plt.tight_layout()
-    plt.savefig(project_path(f"results/figures/{MODEL_NAME}_pnl_distribution.png"), dpi=150, bbox_inches="tight")
+    plt.savefig(project_path(f"results/figures/{MODEL_NAME_OUT}_pnl_distribution.png"), dpi=150, bbox_inches="tight")
     plt.close()
     print("P&L distribution plot saved.")
 
@@ -390,7 +374,7 @@ def test(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_deltas, hedgin
         "bsm_std_pnl":     float(bsm_pnl.std()),
         "nn_percentiles":  dict(zip([f"P{p}" for p in percentiles], nn_pcts.tolist())),
         "bsm_percentiles": dict(zip([f"P{p}" for p in percentiles], bsm_pcts.tolist())),
-        "learned_premium": float(hedging_net.premium.item()),
+        "learned_premium": float(learned_premiums_test.mean()),
         "bsm_atm_price":   float(bsm_call(1.0, 1.0, 0, 0.20, T)),
     }
 
@@ -398,10 +382,10 @@ def test(features_test: torch.Tensor, Sigma_test: np.ndarray, bsm_deltas, hedgin
 # ── Results logger ────────────────────────────────────────────────────────────
 
 def save_results(epoch_losses: list, test_stats: dict) -> None:
-    path = project_path(f"results/logs/{MODEL_NAME}_training_results.txt")
+    path = project_path(f"results/logs/{MODEL_NAME_OUT}_training_results.txt")
     with open(path, "w") as f:
         f.write("=" * 70 + "\n")
-        f.write("  DEEP HEDGING - TRAINING RUN RESULTS\n")
+        f.write("  DEEP HEDGING - TRAINING RUN RESULTS (DUAL NET)\n")
         f.write("=" * 70 + "\n\n")
 
         f.write("── Run configuration ──────────────────────────────────────────\n")
@@ -430,13 +414,13 @@ def save_results(epoch_losses: list, test_stats: dict) -> None:
         f.write(f"  {'─'*66}\n")
         f.write(f"  {'Mean P&L':40s}  {test_stats['nn_mean_pnl']:>12.6f}  "
                 f"{test_stats['bsm_mean_pnl']:>12.6f}\n")
-        f.write(f"  {'Std P&L':40s}  {test_stats['nn_std_pnl']:>12.6f}  "
+        f.write(f"  {'STD P&L':40s}  {test_stats['nn_std_pnl']:>12.6f}  "
                 f"{test_stats['bsm_std_pnl']:>12.6f}\n")
         for key in test_stats["nn_percentiles"]:
             nn_v  = test_stats["nn_percentiles"][key]
             bsm_v = test_stats["bsm_percentiles"][key]
             f.write(f"  {key:40s}  {nn_v:>12.6f}  {bsm_v:>12.6f}\n")
-        f.write(f"\n  {'Learned premium (S/K units)':40s}  "
+        f.write(f"\n  {'Mean Learned premium (S/K units)':40s}  "
                 f"{test_stats['learned_premium']:>12.6f}\n")
         f.write(f"  {'BSM ATM price (sigma=0.20)':40s}  "
                 f"{test_stats['bsm_atm_price']:>12.6f}\n")
@@ -447,8 +431,8 @@ def save_results(epoch_losses: list, test_stats: dict) -> None:
 
 # ── Model persistence ─────────────────────────────────────────────────────────
 
-def save_model(hedging_net: HedgingNet) -> None:
-    path = project_path(f"results/models/{MODEL_NAME}_hedging_model.pt")
+def save_model(hedging_net: HedgingNet2) -> None:
+    path = project_path(f"results/models/{MODEL_NAME_OUT}_hedging_model.pt")
     torch.save({
         "hedging_net_state": hedging_net.state_dict(),
         "params": {
@@ -462,11 +446,18 @@ def save_model(hedging_net: HedgingNet) -> None:
     print(f"Model saved to '{path}'")
 
 
-def load_model() -> HedgingNet:
-    path        = project_path(f"results/models/{MODEL_NAME}_hedging_model.pt")
+def load_model() -> HedgingNet2:
+    path        = project_path(f"results/models/{MODEL_NAME_OUT}_hedging_model.pt")
     checkpoint  = torch.load(path, map_location=DEVICE)
     
-    hedging_net = HedgingNet(N_FEATURES, HIDDEN_NEURONS, HIDDEN_LAYERS, ACTIVATION_PARAM).to(DEVICE)
+    hedging_net = HedgingNet2(
+        hedging_features=N_FEATURES,
+        hedging_hidden_neurons=HIDDEN_NEURONS,
+        hedging_depth=HIDDEN_LAYERS,
+        gamma=ACTIVATION_PARAM,
+        pricing_hidden_neurons=PRICING_HIDDEN_NEURONS,
+        pricing_depth=PRICING_HIDDEN_LAYERS
+    ).to(DEVICE)
     
     hedging_net.load_state_dict(checkpoint["hedging_net_state"])
     return hedging_net
@@ -489,7 +480,7 @@ if __name__ == "__main__":
         T        = T,
         paths    = N_PATHS_TRAIN,
         rng      = rng,
-    )   # (N_PATHS_TRAIN, N+1, 4)
+    )   
     features_train = features_train[:, :, :N_FEATURES]
 
     print("\n── Training ──")

@@ -1,10 +1,10 @@
 from project.helpers.helpers import get_torch_device
 
 S0 = 100.0
-K_LO = 90.0
-K_HI = 110.0
+K_LO = 80.0
+K_HI = 120.0
 SIGMA_LO = 0.10
-SIGMA_HI = 0.40
+SIGMA_HI = 0.30
 T = 1.0
 
 DEVICE = get_torch_device()

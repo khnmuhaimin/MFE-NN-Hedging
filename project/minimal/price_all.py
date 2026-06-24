@@ -21,7 +21,8 @@ import os
 
 from project.stock.generators import generate_gbm_augmented
 from project.helpers.path_helpers import project_path
-from helpers.helpers import get_torch_device
+from project.helpers.helpers import get_torch_device
+from project.minimal.constants import S0, K_LO, K_HI, SIGMA_LO, SIGMA_HI, T
 
 
 
@@ -31,15 +32,6 @@ def do_NN(MODEL: str):
     os.makedirs(project_path("results/figures"), exist_ok=True)
     os.makedirs(project_path("results/models"), exist_ok=True)
     os.makedirs(project_path("results/logs"),   exist_ok=True)
-
-    # ── Market / simulation parameters ────────────────────────────────────────────
-    S0       = 100.0
-    K_LO     = 90.0       # lower bound for sampled strikes
-    K_HI     = 110.0      # upper bound for sampled strikes
-    SIGMA_LO = 0.10       # lower bound for sampled vol
-    SIGMA_HI = 0.40       # upper bound for sampled vol
-    R        = 0.0        # risk-free rate
-    T        = 1.0        # horizon (years)
 
     # ── Training hyper-parameters ─────────────────────────────────────────────────
     N_PATHS_TRAIN = 10_000
@@ -94,7 +86,7 @@ def do_NN(MODEL: str):
     HIDDEN_LAYERS = HYPERPARAMETER_MAP[MODEL]["d"]
     LEARNING_RATE = HYPERPARAMETER_MAP[MODEL]["eta"]
     BATCH_SIZE = HYPERPARAMETER_MAP[MODEL]["B"]
-    N_EPOCHS = HYPERPARAMETER_MAP[MODEL]["s"] + 20
+    N_EPOCHS = HYPERPARAMETER_MAP[MODEL]["s"]
     ACTIVATION_PARAM = HYPERPARAMETER_MAP[MODEL]["gamma"]
     GRAD_CLIP_THRESHOLD = HYPERPARAMETER_MAP[MODEL]["c"]
 
@@ -320,7 +312,7 @@ def do_NN(MODEL: str):
         # 1. Premium calculation
         # For a realistic baseline, we price the initial option using the true sigma 
         # (implied vol at t=0), or you can use your training midpoint here.
-        premium = bsm_call(1.0, 1.0, R, sigmas, T) 
+        premium = bsm_call(1.0, 1.0, 0, sigmas, T) 
 
         # 2. Dynamic Rebalancing Loop
         for t in range(N):
@@ -332,7 +324,7 @@ def do_NN(MODEL: str):
             trade       = delta - prev_delta
             currency   -= trade * St
             underlying += trade
-            currency   *= np.exp(R * H)
+            # currency   *= np.exp(R * H)
             prev_delta  = delta
 
         # 3. Final Settlement at Expiry
@@ -456,7 +448,7 @@ def do_NN(MODEL: str):
         for p, nn_v, bsm_v in zip(percentiles, nn_pcts, bsm_pcts):
             print(f"  {f'P{p}':35s}  {nn_v:>10.6f}  {bsm_v:>10.6f}")
         print(f"\n  {'Learned premium (S/K units)':35s}  {hedging_net.premium.item():>10.6f}")
-        print(f"  {'BSM ATM price (sigma=0.20)':35s}  {bsm_call(1.0, 1.0, R, 0.20, T):>10.6f}")
+        print(f"  {'BSM ATM price (sigma=0.20)':35s}  {bsm_call(1.0, 1.0, 0, 0.20, T):>10.6f}")
         print("=" * 70)
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
@@ -489,7 +481,7 @@ def do_NN(MODEL: str):
             "nn_percentiles":  dict(zip([f"P{p}" for p in percentiles], nn_pcts.tolist())),
             "bsm_percentiles": dict(zip([f"P{p}" for p in percentiles], bsm_pcts.tolist())),
             "learned_premium": float(hedging_net.premium.item()),
-            "bsm_atm_price":   float(bsm_call(1.0, 1.0, R, 0.20, T)),
+            "bsm_atm_price":   float(bsm_call(1.0, 1.0, 0, 0.20, T)),
         }
 
 
@@ -552,7 +544,7 @@ def do_NN(MODEL: str):
             "params": {
                 "S0": S0, "K_LO": K_LO, "K_HI": K_HI,
                 "SIGMA_LO": SIGMA_LO, "SIGMA_HI": SIGMA_HI,
-                "R": R, "T": T, "N": N, "H": H,
+                "R": 0, "T": T, "N": N, "H": H,
                 "N_FEATURES": N_FEATURES,
             },
             "seed": SEED,
