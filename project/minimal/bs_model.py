@@ -1,3 +1,8 @@
+"""
+Utility functions for the Black-Scholes model
+"""
+
+
 import numpy as np
 import torch
 from scipy.stats import norm

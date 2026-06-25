@@ -1,3 +1,8 @@
+"""
+Constants used by the project to train and test the neural networks
+"""
+
+
 from project.helpers.helpers import get_torch_device
 
 S0 = 100.0
