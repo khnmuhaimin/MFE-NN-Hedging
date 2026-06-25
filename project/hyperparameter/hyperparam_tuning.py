@@ -9,9 +9,9 @@ from scipy.stats import norm
 
 DEVICE = torch.device("cpu")
 
-# ------------------ some necessary variables and such
+# some necessary variables and such
 K, r, T = 1.0, 0.0, 1.0
-MONEYNESS_RANGE = (0.85, 1.15)
+MONEYNESS_RANGE = (0.8, 1.2)
 SIGMA_RANGE = (0.1, 0.3)
 SIGMA_FIXED = 0.2
 DAILY_STEPS = 252
@@ -37,7 +37,7 @@ FEATURE_NAMES = FEATURE_CONFIGS["base"]
 INPUT_DIM = 2
 VERSION_NAME = "base__monthly"
 
-# -------------------- the grids for the search
+# the grids for the search
 MONTHLY_GRID = {
     "hidden": [64, 128],
     "depth": [3, 4],
@@ -59,9 +59,9 @@ def configure_version(feature_set, rebalance_freq):
     global N, REBAL_INDICES, REBAL_TAUS, FEATURE_NAMES, INPUT_DIM, VERSION_NAME
 
     N = REBALANCE_CONFIGS[rebalance_freq]
-    stride = DAILY_STEPS // N
+    stride = DAILY_STEPS//N
     REBAL_INDICES = list(range(0, DAILY_STEPS, stride))
-    REBAL_TAUS = [1.0 - i / DAILY_STEPS for i in REBAL_INDICES]
+    REBAL_TAUS = [1.0 - i/DAILY_STEPS for i in REBAL_INDICES]
     FEATURE_NAMES = FEATURE_CONFIGS[feature_set]
     INPUT_DIM = len(FEATURE_NAMES)
     VERSION_NAME = f"{feature_set}__{rebalance_freq}"
@@ -70,7 +70,7 @@ def configure_version(feature_set, rebalance_freq):
 
     return VERSION_NAME
 
-# simulate GBM paths with random moneyness in [0.85,1.15] and sigma in [0.1,0.3]
+# simulate GBM paths with random moneyness in [0.8,1.2] and sigma in [0.1,0.3]
 def make_paths(n_paths, seed=None):
 
     rng = np.random.default_rng(seed)
@@ -86,7 +86,7 @@ def make_paths(n_paths, seed=None):
 
     return S_full, sigmas, moneynesses
 
-# annualised realised vol from the price history so far (torch, for the network)
+# calculate annualised realised volatility from the price history up to current time t (this one is for the network features)
 def realized_vol_feat(S_hist):
 
     batch, n_obs = S_hist.shape
@@ -97,7 +97,7 @@ def realized_vol_feat(S_hist):
     return log_ret.std(dim=1, unbiased=False)/(H_DAILY**0.5)
 
 
-# Black-Scholes delta from the realised-vol estimate, never the true sigma
+# BSM delta from the realised volatility estimate
 def bs_delta_feat(St, sigma_hat, tau):
 
     sig = torch.clamp(sigma_hat, min=0.01)
@@ -108,7 +108,7 @@ def bs_delta_feat(St, sigma_hat, tau):
     return 0.5*(1.0 + torch.erf(d1/(2**0.5)))
 
 
-# stack the chosen input features into one (batch, INPUT_DIM) tensor
+# stack all network inputs together (obviously depending on the feature set)
 def make_inputs(S_hist, tau):
 
     batch = S_hist.shape[0]
@@ -130,9 +130,9 @@ class hyper_params:
     epochs: int = 40
     clip_norm: float = 1.0
 
-# feed-forward delta network; sigmoid output keeps a call delta in (0,1)
+# creating the feedforward hedger network with the necessary architecture (tunable in this case dependent on hyperparams)
 class hedger_NN(nn.Module):
-    # build the layer stack from the hyperparameters
+    # build the layers
     def __init__(self, hp):
         super().__init__()
         layers = [nn.Linear(INPUT_DIM, hp.hidden), nn.ReLU()]
@@ -142,7 +142,7 @@ class hedger_NN(nn.Module):
         self.net = nn.Sequential(*layers)
         self.premium = nn.Parameter(torch.tensor(0.0))
 
-    # forward pass: inputs -> hedge ratio (delta)
+    # forward pass (as defined in the Chapter 3)
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
@@ -167,7 +167,7 @@ def roll_hedge(S_batch, net):
 
     return net.premium + underlying*S_T + currency - payoff
 
-# vectorised Black-Scholes call price
+# BSM call price
 def bsm_call_vec(S0_vec, sigma_vec):
 
     d1 = (np.log(S0_vec/K) + 0.5*sigma_vec**2*T)/(sigma_vec*np.sqrt(T))
@@ -175,7 +175,7 @@ def bsm_call_vec(S0_vec, sigma_vec):
 
     return S0_vec*norm.cdf(d1) - K*norm.cdf(d2)
 
-# vectorised Black-Scholes delta at time t
+# BSM delta
 def bsm_delta_vec(S, sigma_vec, t):
 
     tau = T - t
@@ -185,7 +185,7 @@ def bsm_delta_vec(S, sigma_vec, t):
 
     return norm.cdf(d1)
 
-# annualised realised vol from price history (numpy, for the benchmark)
+# realised vol from price history (this one is for the benchmark)
 def realized_vol_np(S_hist_np):
 
     if S_hist_np.shape[0] < 2:
@@ -194,7 +194,7 @@ def realized_vol_np(S_hist_np):
 
     return log_ret.std(axis=0, ddof=0)/(H_DAILY**0.5)
 
-# benchmark P&L using the same info the network sees (fixed sigma, or realised vol)
+# benchmark P&L using the same info the network sees
 def practitioner_bsm_pnl(S, moneynesses, feature_set):
 
     n_paths = S.shape[1]
@@ -202,11 +202,8 @@ def practitioner_bsm_pnl(S, moneynesses, feature_set):
     underlying = np.zeros(n_paths)
     prev_delta = np.zeros(n_paths)
 
-    if feature_set == "base":
-        sigma_arr = np.full(n_paths, SIGMA_FIXED)
-        premium = float(bsm_call_vec(moneynesses, sigma_arr).mean())
-    else:
-        premium = float(bsm_call_vec(moneynesses, np.full(n_paths, SIGMA_FIXED)).mean())
+    sigma_arr = np.full(n_paths, SIGMA_FIXED)
+    premium = float(bsm_call_vec(moneynesses, sigma_arr).mean())
 
     for daily_idx in REBAL_INDICES:
         if feature_set == "base":
@@ -226,7 +223,7 @@ def practitioner_bsm_pnl(S, moneynesses, feature_set):
 
     return premium + underlying*S_T + currency - np.maximum(S_T - K, 0)
 
-# train one hyperparameter config; return the net and its best validation P&L std
+# train the hedge network for one hyperparameter config and then return the net and its best validation P&L std
 def train_one_config(hp, train_t, val_t):
 
     net = hedger_NN(hp).to(DEVICE)
@@ -251,7 +248,7 @@ def train_one_config(hp, train_t, val_t):
 
     return net, best_val
 
-# retrain the winning config across seeds to check it isn't an initialisation fluke
+# retrain the winning config across seeds to check that it didn't just get lucky on initialisation
 def confirm_with_seeds(hp, train_t, val_t, n_seeds=5):
 
     scores = []
@@ -265,7 +262,7 @@ def confirm_with_seeds(hp, train_t, val_t, n_seeds=5):
 
     return arr
 
-# run the full grid search for one version and confirm the best across seeds
+# run the full grid search for one hedge network version and confirm the best across seeds
 def grid_search(feature_set, rebalance_freq, epochs=40, n_seeds=5):
 
     configure_version(feature_set, rebalance_freq)
@@ -306,6 +303,7 @@ def grid_search(feature_set, rebalance_freq, epochs=40, n_seeds=5):
 # MAIN programme run
 if __name__ == "__main__":
 
+    # all four hedge network versions to tune with premium as a separate scalar
     VERSIONS_TO_RUN = [
         ("base", "monthly"),
         ("base", "daily"),
