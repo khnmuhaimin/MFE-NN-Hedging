@@ -37,32 +37,11 @@ MFE-NN-Hedging/
 │   │   ├── hyperparam_tuning.py  # Grid search over architecture and optimisation params
 │   │   ├── trainingSet_sweep.py  # Training set size sweep
 │   │   └── validation_bootstrap.py # Bootstrap CI for validation/test set sizing
-│   ├── stock/
-│   │   └── generators.py         # GBM path generation (and Heston/Bates extensions)
-│   ├── helpers/
-│   │   ├── helpers.py            # Device selection and general utilities
-│   │   └── path_helpers.py       # File path utilities
-│   └── transaction costs/        # Experimental extension: TC-aware hedging with CVaR/entropic loss
-├── results/
-│   ├── figures/                  # Output plots (P&L distributions, delta curves, forest plots, etc.)
-│   ├── models/                   # Saved model weights (.pt)
-│   ├── logs/                     # Training logs per model version
-│   ├── hyperparameter/           # Grid search results
-│   ├── dataset_size/             # Training set size sweep results
-│   └── set_sizes/                # Bootstrap CI results for val/test sizing
+│   └── stock/
+│       └── generators.py         # GBM path generation (and Heston/Bates extensions)
 ├── requirements.txt
 └── README.md
 ```
-
-## Installation
-
-Python 3.12 is recommended. Install dependencies with:
-
-```bash
-pip install -r requirements.txt
-```
-
-Key dependencies: `torch==2.11.0`, `numpy==2.4.4`, `scipy==1.17.1`, `matplotlib==3.10.8`.
 
 ## Usage
 
@@ -85,7 +64,7 @@ Run the main pricer from the repository root:
 python -m project.minimal2.new_pricer
 ```
 
-This trains the hedge and premium networks jointly, evaluates against the practitioner BS benchmark on a held-out test set, and writes figures to `results/figures/` and model weights to `results/models/`.
+This trains the hedge and premium networks jointly and evaluates against the practitioner BS benchmark on a held-out test set.
 
 ### 3. Hyperparameter tuning
 
