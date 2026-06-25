@@ -107,21 +107,3 @@ The MSE-optimal premium converges to the Black-Scholes risk-neutral price (see S
 | Validation paths | 20,000 |
 | Test paths | 20,000 |
 
-## Results Summary
-
-| Strategy | Mean P&L | Std P&L |
-|----------|----------|---------|
-| 4-Input Daily (V4) | −0.16 | **1.98** |
-| 4-Input Monthly (V3) | −0.15 | 2.72 |
-| 2-Input Daily (V2) | −0.17 | 2.33 |
-| 2-Input Monthly (V1) | −0.75 | 2.86 |
-| BS Hedge Daily | +2.19 | 7.92 |
-| BS Hedge Monthly | −1.92 | 7.40 |
-
-P&L is expressed as a percentage of the strike. The neural network strategies achieve roughly a **threefold reduction** in P&L standard deviation relative to the BS benchmark across all moneyness buckets (OTM, ATM, ITM).
-
-## Citation
-
-If referencing this work, please cite:
-
-> Reve, A., Khan, M., & Louw, R. (2026). *Constructing Hedge Portfolios with Neural Networks*. MFE Research Project, African Institute for Financial Markets and Risk Management (AIFMRM).
