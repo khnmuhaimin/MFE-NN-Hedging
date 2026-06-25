@@ -11,7 +11,7 @@ MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# edit REBALANCE to switch between monthly and daily
+# some variables and settings
 REBALANCE = "monthly"
 HP = {
     "monthly": dict(N=12,  hidden=64,  depth=4, lr=0.01, batch_size=1024, clip_norm=1.0),
